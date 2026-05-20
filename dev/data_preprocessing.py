@@ -52,11 +52,13 @@ if __name__ == "__main__":
             # "24",
             # "--use_gpu",
             # "--verbose",
-            "--reanalysis",
+            # "--reanalysis",
             "--cache_dir",
             "/scratch/mgomezd1/cache",
             "--mask",
             "--magAngle_mode",
+            "--mask_ptile",
+            "50",
         ]
     # %%
     # check if the context has been set for torch multiprocessing
@@ -205,6 +207,12 @@ if __name__ == "__main__":
         help="Whether to use an auxiliary loss",
     )
 
+    parser.add_argument(
+        "--mask_ptile",
+        type=int,
+        default=84,
+    )
+
     args = parser.parse_args()
 
     print("Imports successful", flush=True)
@@ -218,6 +226,9 @@ if __name__ == "__main__":
     cache_dir = os.path.join(
         args.cache_dir, f"_{args.ai_model}" if not args.reanalysis else "ERA5"
     )
+    if args.mask_ptile != 84:
+        cache_dir = cache_dir+ f"_{args.mask_ptile}ptile"
+
     result_dir = args.result_dir
 
     num_cores = int(subprocess.check_output(["nproc"], text=True).strip())
@@ -266,6 +277,7 @@ if __name__ == "__main__":
         )
 
     # %%
+    print("Leadtime Masking...", flush=True)
     # create a mask for the leadtimes
     train_ldt_mask = da.logical_and(
         data["train"]["leadtime"] >= args.min_leadtime,
@@ -444,19 +456,19 @@ if __name__ == "__main__":
 
     if not found or args.overwrite_cache:
         dask.config.set(scheduler="threads")
-        train_data.rechunk((1000, -1, -1, -1)).to_zarr(
+        train_data.rechunk((500, -1, -1, -1)).to_zarr(
             zarr_store,
             component="train/AIX",
             overwrite=True,
         )
         print("Train data stored in cache...", flush=True)
-        train_target.rechunk((1000, -1, -1)).to_zarr(
+        train_target.rechunk((500, -1, -1)).to_zarr(
             zarr_store,
             component="train/target",
             overwrite=True,
         )
         print("Train target stored in cache...", flush=True)
-        valid_data.rechunk((1000, -1, -1, -1)).to_zarr(
+        valid_data.rechunk((500, -1, -1, -1)).to_zarr(
             zarr_store,
             component="validation/AIX",
             overwrite=True,
@@ -464,35 +476,33 @@ if __name__ == "__main__":
         print("Validation data stored in cache...", flush=True)
         valid_target.rechunk(
             (
-                1000,
+                800,
                 -1,
                 -1,
             )
         ).to_zarr(zarr_store, component="validation/target", overwrite=True)
         print("Validation target stored in cache...", flush=True)
-        test_data.rechunk((1000, -1, -1, -1)).to_zarr(
+        test_data.rechunk((500, -1, -1, -1)).to_zarr(
             zarr_store,
             component="test/AIX",
             overwrite=True,
         )
         print("Test data stored in cache...", flush=True)
-        test_target.rechunk((1000, -1, -1)).to_zarr(
+        test_target.rechunk((500, -1, -1)).to_zarr(
             zarr_store, component="test/target", overwrite=True
         )
         print("Test target stored in cache...", flush=True)
     # %%
     # Load the data from the zarr store
     train_data = da.from_zarr(
-        zarr_store, component="train/AIX", chunks=(1000, -1, -1, -1)
+        zarr_store, component="train/AIX", chunks=(500, -1, -1, -1)
     )
     train_target = da.from_zarr(zarr_store, component="train/target")
     valid_data = da.from_zarr(
-        zarr_store, component="validation/AIX", chunks=(1000, -1, -1, -1)
+        zarr_store, component="validation/AIX", chunks=(500, -1, -1, -1)
     )
     valid_target = da.from_zarr(zarr_store, component="validation/target")
-    test_data = da.from_zarr(
-        zarr_store, component="test/AIX", chunks=(1000, -1, -1, -1)
-    )
+    test_data = da.from_zarr(zarr_store, component="test/AIX", chunks=(500, -1, -1, -1))
     test_target = da.from_zarr(zarr_store, component="test/target")
 
     # %%
@@ -609,6 +619,9 @@ if __name__ == "__main__":
 
     if args.mask and ((not found) or args.overwrite_cache):
         mask_path = args.mask_path
+        if args.mask_ptile != 84:
+            #replace .pkl with _ptile.pkl
+            mask_path = mask_path.replace(".pkl", f"_{args.mask_ptile}ptile.pkl")
         with open(mask_path, "rb") as f:
             mask_dict = pickle.load(f)[args.mask_type]
 
@@ -616,21 +629,21 @@ if __name__ == "__main__":
         unique_leads = da.unique(data["train"]["leadtime"]).compute(scheduler="threads")
         train_mask = zr.ones(
             (train_data.shape[0], 1, 241, 241),
-            chunks=(1000, 1, 241, 241),
+            chunks=(500, 1, 241, 241),
             store=zarr_store,
             path="train/mask",
             overwrite=True,
         )
         valid_mask = zr.ones(
             (valid_data.shape[0], 1, 241, 241),
-            chunks=(1000, 1, 241, 241),
+            chunks=(500, 1, 241, 241),
             store=zarr_store,
             path="validation/mask",
             overwrite=True,
         )
         test_mask = zr.ones(
             (test_data.shape[0], 1, 241, 241),
-            chunks=(1000, 1, 241, 241),
+            chunks=(500, 1, 241, 241),
             store=zarr_store,
             path="test/mask",
             overwrite=True,
@@ -663,13 +676,13 @@ if __name__ == "__main__":
         print("Done!", flush=True)
 
         train_mask = da.from_zarr(
-            zarr_store, component="train/mask", chunks=(1000, -1, -1, -1)
+            zarr_store, component="train/mask", chunks=(500, -1, -1, -1)
         )
         valid_mask = da.from_zarr(
-            zarr_store, component="validation/mask", chunks=(1000, -1, -1, -1)
+            zarr_store, component="validation/mask", chunks=(500, -1, -1, -1)
         )
         test_mask = da.from_zarr(
-            zarr_store, component="test/mask", chunks=(1000, -1, -1, -1)
+            zarr_store, component="test/mask", chunks=(500, -1, -1, -1)
         )
 
         # Function to apply the mask to each block of images
@@ -707,23 +720,23 @@ if __name__ == "__main__":
 
         # Load the data from the zarr store
         train_data = da.from_zarr(
-            zarr_store, component="train/masked_AIX", chunks=(1000, -1, -1, -1)
+            zarr_store, component="train/masked_AIX", chunks=(500, -1, -1, -1)
         )
         valid_data = da.from_zarr(
-            zarr_store, component="validation/masked_AIX", chunks=(1000, -1, -1, -1)
+            zarr_store, component="validation/masked_AIX", chunks=(500, -1, -1, -1)
         )
         test_data = da.from_zarr(
-            zarr_store, component="test/masked_AIX", chunks=(1000, -1, -1, -1)
+            zarr_store, component="test/masked_AIX", chunks=(500, -1, -1, -1)
         )
     elif args.mask and found:
         train_data = da.from_zarr(
-            zarr_store, component="train/masked_AIX", chunks=(1000, -1, -1, -1)
+            zarr_store, component="train/masked_AIX", chunks=(500, -1, -1, -1)
         )
         valid_data = da.from_zarr(
-            zarr_store, component="validation/masked_AIX", chunks=(1000, -1, -1, -1)
+            zarr_store, component="validation/masked_AIX", chunks=(500, -1, -1, -1)
         )
         test_data = da.from_zarr(
-            zarr_store, component="test/masked_AIX", chunks=(1000, -1, -1, -1)
+            zarr_store, component="test/masked_AIX", chunks=(500, -1, -1, -1)
         )
     # %%
     # handle the leadtime in the zarr store
@@ -736,22 +749,22 @@ if __name__ == "__main__":
     )
 
     if not found or args.overwrite_cache:
-        data["train"]["leadtime"][train_ldt_mask].rechunk((1000, -1)).to_zarr(
+        data["train"]["leadtime"][train_ldt_mask].rechunk((500, -1)).to_zarr(
             zarr_store, component="train/leadtime", overwrite=True
         )
-        data["validation"]["leadtime"][validation_ldt_mask].rechunk((1000, -1)).to_zarr(
+        data["validation"]["leadtime"][validation_ldt_mask].rechunk((500, -1)).to_zarr(
             zarr_store, component="validation/leadtime", overwrite=True
         )
-        data["test"]["leadtime"][test_ldt_mask].rechunk((1000, -1)).to_zarr(
+        data["test"]["leadtime"][test_ldt_mask].rechunk((500, -1)).to_zarr(
             zarr_store, component="test/leadtime", overwrite=True
         )
-        train_leadtimes.rechunk((1000, -1)).to_zarr(
+        train_leadtimes.rechunk((500, -1)).to_zarr(
             zarr_store, component="train/leadtime_scaled", overwrite=True
         )
-        validation_leadtimes.rechunk((1000, -1)).to_zarr(
+        validation_leadtimes.rechunk((500, -1)).to_zarr(
             zarr_store, component="validation/leadtime_scaled", overwrite=True
         )
-        test_leadtimes.rechunk((1000, -1)).to_zarr(
+        test_leadtimes.rechunk((500, -1)).to_zarr(
             zarr_store, component="test/leadtime_scaled", overwrite=True
         )
 
@@ -776,22 +789,22 @@ if __name__ == "__main__":
     )
 
     if not found or args.overwrite_cache:
-        data["train"]["base_intensity"][train_ldt_mask].rechunk((1000, -1, -1)).to_zarr(
+        data["train"]["base_intensity"][train_ldt_mask].rechunk((500, -1, -1)).to_zarr(
             zarr_store, component="train/base_intensity", overwrite=True
         )
         data["validation"]["base_intensity"][validation_ldt_mask].rechunk(
-            (1000, -1, -1)
+            (500, -1, -1)
         ).to_zarr(zarr_store, component="validation/base_intensity", overwrite=True)
-        data["test"]["base_intensity"][test_ldt_mask].rechunk((1000, -1, -1)).to_zarr(
+        data["test"]["base_intensity"][test_ldt_mask].rechunk((500, -1, -1)).to_zarr(
             zarr_store, component="test/base_intensity", overwrite=True
         )
-        train_positions.rechunk((1000, -1)).to_zarr(
+        train_positions.rechunk((500, -1)).to_zarr(
             zarr_store, component="train/base_position", overwrite=True
         )
-        valid_positions.rechunk((1000, -1)).to_zarr(
+        valid_positions.rechunk((500, -1)).to_zarr(
             zarr_store, component="validation/base_position", overwrite=True
         )
-        test_positions.rechunk((1000, -1)).to_zarr(
+        test_positions.rechunk((500, -1)).to_zarr(
             zarr_store, component="test/base_position", overwrite=True
         )
 

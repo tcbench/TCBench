@@ -13,3 +13,7 @@ dev/results/*
 dev/utils/__pycache__/*
 /tracks/*
 *.pt
+**/*.pdf
+**/data/
+**/outputs/
+**/requirementstester/

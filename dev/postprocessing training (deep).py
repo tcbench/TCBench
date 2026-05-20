@@ -55,7 +55,7 @@ if __name__ == "__main__":
             # "24",
             # "--use_gpu",
             # "--verbose",
-            # "--reanalysis",
+            "--reanalysis",
             "--cache_dir",
             "/scratch/mgomezd1/cache",
             # "/srv/scratch/mgomezd1/cache",
@@ -65,7 +65,7 @@ if __name__ == "__main__":
             "probabilistic",
             "--search",
             "--algorithm",
-            "unet",
+            "UNetv2",
         ]
     # %%
     # check if the context has been set for torch multiprocessing
@@ -350,6 +350,16 @@ if __name__ == "__main__":
         train_unscaled_leadtimes = train_zarr["leadtime"]
         validation_unscaled_leadtimes = valid_zarr["leadtime"]
 
+    # Clean up validation NaNs if present. TODO: figure out why they're there in reanalysis data
+    if args.reanalysis:
+        nan_idxs = np.isnan(valid_data).any(axis=(1, 2, 3))
+        valid_data = valid_data.oindex[~nan_idxs]
+        valid_target = valid_target.oindex[~nan_idxs]
+        validation_leadtimes = validation_leadtimes.oindex[~nan_idxs]
+        valid_base_intensity = valid_base_intensity.oindex[~nan_idxs]
+        valid_base_position = valid_base_position.oindex[~nan_idxs]
+        validation_unscaled_leadtimes = validation_unscaled_leadtimes.oindex[~nan_idxs]
+
     # %%
     #  Dataloader & Hyperparameters
 
@@ -427,6 +437,8 @@ if __name__ == "__main__":
         modelClass = baselines.UNet
     elif args.algorithm == "UNetv2":
         modelClass = baselines.UNet_v2
+    elif args.algorithm == "Prob_UNet":
+        modelClass = baselines.Prob_UNet
     else:
         raise ValueError("Model not recognized.")
 
@@ -498,7 +510,7 @@ if __name__ == "__main__":
             optimizers.append(optimizer)
 
     num_epochs = 40
-    patience = 15  # stop if validation loss increases for patience epochs
+    patience = 5  # stop if validation loss increases for patience epochs
     bias_threshold = 30  # stop if validation loss / train loss > bias_threshold
 
     #  Training
@@ -737,8 +749,10 @@ if __name__ == "__main__":
                     end="",
                     flush=True,
                 )
+
         if not search:
             val_loss = val_loss / len(validation_loader)
+            print(f"\nValidation loss: {val_loss:.4f}", flush=True)
             val_losses.append(val_loss)
             if args.aux_loss:
                 val_base_loss = val_base_loss / len(validation_loader)
@@ -746,15 +760,25 @@ if __name__ == "__main__":
                 val_base_losses.append(val_base_loss)
                 val_aux_losses.append(val_aux_loss)
 
-            # Save if the validation loss is the best so far
-            if val_loss <= max(val_losses):
-                torch.save(
-                    CNN,
-                    os.path.join(
-                        result_dir,
-                        f"{str(CNN.tags[0])}_{start_time}_epoch-{epoch+1}_{CNN.savetag}.pt",
-                    ),
-                )
+            # save the model
+            torch.save(
+                CNN,
+                os.path.join(
+                    result_dir,
+                    f"{str(CNN.tags[0])}_{start_time}_epoch-{epoch + 1}_{CNN.savetag}.pt",
+                ),
+            )
+
+            # # Save if the validation loss is the best so far
+            # if val_loss <= np.max(val_losses):
+            #     torch.save(
+            #         CNN,
+            #         os.path.join(
+            #             result_dir,
+            #             f"{str(CNN.tags[0])}_{start_time}_epoch-{epoch+1}_{CNN.savetag}.pt",
+            #         ),
+            #     )
+
         else:
             for j, model in enumerate(models):
                 val_losses[j].append(val_loss[j] / len(validation_loader))
@@ -782,14 +806,19 @@ if __name__ == "__main__":
 
         if not search:
             # Early stopping
-            # Stop if the validation loss has been increasing on average for the last patience epochs
-            if epoch > patience:
-                if (
-                    np.mean(np.gradient(val_losses)[-patience:]) > 0
-                    or val_loss / train_loss > bias_threshold
-                ):
+            # Stop if the validation loss isn't better than the last patience epochs
+            if len(val_losses) > patience:
+                if val_losses[-1] > np.mean(val_losses[-(patience + 1) : -1]):
                     print(f"Early stopping at epoch {epoch+1}")
                     break
+            ## Stop if the validation loss has been increasing on average for the last patience epochs
+            # if epoch > patience:
+            #     if (
+            #         np.mean(np.gradient(val_losses)[-patience:]) > 0
+            #         or val_loss / train_loss > bias_threshold
+            #     ):
+            #         print(f"Early stopping at epoch {epoch+1}")
+            #         break
 
             # Let's save the train and validation losses in a pickled dictionary
             losses = {"train": train_losses, "validation": val_losses}

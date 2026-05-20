@@ -8,6 +8,7 @@ used in other scripts to perform the data tasks associated with TCBench
 
 @author: mgomezd1
 """
+
 # %% Imports
 
 import os
@@ -17,10 +18,12 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib
 import xarray as xr
-import metpy.calc as mpcalc
-import metpy.units as mpunits
+
+# import metpy.calc as mpcalc
+# import metpy.units as mpunits
 import joblib as jl
-from memory_profiler import profile
+
+# from memory_profiler import profile
 from pint import Quantity
 import dask
 import dask.array as da
@@ -328,32 +331,35 @@ class Data_Collection:
                         xr.open_mfdataset(file_list[-1]).data_vars
                     )[0]
 
-        # Load the dataset
-        temp_ds = kwargs.get("data_loader", xr.open_mfdataset)(
-            file_list,
-            **kwargs.get(
-                "data_loader_kwargs", {"parallel": True, "combine": "by_coords"}
-            ),
-        )
+        # Load the dataset using a for loop, checking that the time coordinate has the right name
+        print("Loading the dataset...", flush=True)
+        temp_ds = None
+        for file in file_list:
+            print(f"Loading {file}...", flush=True)
+            temp_var = xr.open_dataset(
+                file,
+                **kwargs.get("data_loader_kwargs", {"chunks": "auto"}),
+            )
+
+            # handle renaming of time coordinate since copernicus update
+            if temp_var.coords.get("time", None) is None:
+                if temp_var.coords.get("valid_time", None) is not None:
+                    temp_var = temp_var.rename({"valid_time": "time"})
+
+            if temp_ds is None:
+                temp_ds = temp_var
+            else:
+                temp_ds = xr.concat([temp_ds, temp_var], dim="time")
+
+        # # Load the dataset
+        # temp_ds = kwargs.get("data_loader", xr.open_mfdataset)(
+        #     file_list,
+        #     **kwargs.get(
+        #         "data_loader_kwargs", {"parallel": True, "combine": "by_coords"}
+        #     ),
+        # )
         if kwargs.get("verbose", False):
             print("Chunking the dataset...")
-
-        # chunks = kwargs.get("chunks", {"time": 1, "latitude": -1, "longitude": -1})
-        # if hasattr(temp_ds, "level"):
-        #     chunks.update({"level": 2})
-
-        # Set up Dask client with memory limit per worker and set number of workers
-        # client = Client(
-        #     memory_limit=kwargs.get("mem_limit", "40GB"),
-        #     n_workers=kwargs.get("n_workers", 1),
-        # )
-
-        # temp_ds = temp_ds.sel(time=dates).chunk()
-
-        # with dask.config.set(**{"array.slicing.split_large_chunks": True}):
-        #     with ProgressBar():
-        #         # compute the dataset with the client
-        #         temp_ds = temp_ds.compute(scheduler="threads")
 
         # filter the pressure levels if they are requested and present
         if hasattr(temp_ds, "level"):
@@ -377,6 +383,12 @@ class Data_Collection:
                     temp_var = temp_var.rename(f"{data_var_dict[var]}.{level}").chunk(
                         {"time": 1, "latitude": -1, "longitude": -1}
                     )
+
+                    # handle renaming of time coordinate since copernicus update
+                    if temp_var.coords.get("time", None) is None:
+                        if temp_var.coords.get("valid_time", None) is not None:
+                            temp_var = temp_var.rename({"valid_time": "time"})
+
                     print("Computing level...", flush=True)
                     if kwargs.get("verbose", False):
                         with ProgressBar():
@@ -390,6 +402,7 @@ class Data_Collection:
                     print("level computed...", flush=True)
 
                     steps = []
+
                     for date in dates:
                         step_var = temp_var.sel(time=date)
                         step_var = step_var.chunk()
@@ -407,6 +420,12 @@ class Data_Collection:
         else:
             filtered_vars = []
             for date in dates:
+
+                # handle renaming of time coordinate since copernicus update
+                if temp_var.coords.get("time", None) is None:
+                    if temp_var.coords.get("valid_time", None) is not None:
+                        temp_var = temp_var.rename({"valid_time": "time"})
+
                 temp_var = temp_ds.sel(time=date)
                 temp_var = temp_var.chunk()
                 if kwargs.get("verbose", False):
@@ -527,7 +546,7 @@ class Data_Collection:
     #     return ds, data_var_dict
 
     # TODO: Figure out why this explodes memory usage and fix it
-    @profile
+    # @profile
     def calculate_field(
         self,
         function: callable,
@@ -555,11 +574,11 @@ class Data_Collection:
         None or xarray.Dataset
         """
         # Check if the function is a metpy callable
-        if hasattr(mpcalc, function.__name__):
-            # if it is, check that the required units are passed as kwargs
-            assert (
-                "units" in kwargs.keys()
-            ), f"Units are required for {function.__name__} since it's a metpy function."
+        # if hasattr(mpcalc, function.__name__):
+        #     # if it is, check that the required units are passed as kwargs
+        #     assert (
+        #         "units" in kwargs.keys()
+        #     ), f"Units are required for {function.__name__} since it's a metpy function."
 
         # check that the argument names are a dict
         assert isinstance(
@@ -689,16 +708,17 @@ class Data_Collection:
 
             # calculate the field
             data = function(**temp_dict)
-            units = kwargs.get("out_units", str(data.metpy.units))
+            units = kwargs.get("out_units", None)  # str(data.metpy.units))
             print("Fine till here")
-            # create a dataset from the dataarray
-            data = (
-                data.metpy.dequantify()
-                .to_dataset(
-                    name=function.__name__,
-                )
-                .compute()
-            )
+            # # create a dataset from the dataarray
+            # data = (
+            #     data.metpy.dequantify()
+            #     .to_dataset(
+            #         name=function.__name__,
+            #     )
+            #     .compute()
+            # )
+            data = data.compute().to_dataset(name=function.__name__)
 
             # add the attributes
             data.attrs = {
@@ -919,18 +939,34 @@ class AI_Data_Collection:
                 time_str = time_str.replace("h", ":").replace("m", "")
                 time_str = np.datetime64(time_str)
                 if date == time_str:
-                    ds_list.append(
-                        # time_to_validtime(
-                        #     xr.open_dataset(
-                        #         os.path.join(self.data_path, key, file),
-                        #     ),
-                        #     time_str,
-                        # )
-                        xr.open_dataset(
-                            os.path.join(self.data_path, key, file),
-                        ).chunk(chunk_opts)
-                    )
-        ds = xr.concat(ds_list, dim="time")
+                    try:
+                        ds_list.append(
+                            # time_to_validtime(
+                            #     xr.open_dataset(
+                            #         os.path.join(self.data_path, key, file),
+                            #     ),
+                            #     time_str,
+                            # )
+                            xr.open_dataset(
+                                os.path.join(self.data_path, key, file),
+                            ).chunk(chunk_opts)
+                        )
+                    except Exception as e:
+                        print(
+                            f"Error loading file {file} for date {date}: {e}",
+                            flush=True,
+                        )
+                        continue
+        # concatenate the datasets if there are any
+        if len(ds_list) > 1:
+            ds = xr.concat(ds_list, dim="time")
+        elif len(ds_list) == 1:
+            ds = ds_list[0]
+        else:
+            raise ValueError(
+                f"No files found for the requested dates: {dates}. "
+                "Please check the data collection object."
+            )
 
         if kwargs.get("strict_mode", False):
             assert len(ds_list) == len(
@@ -1002,13 +1038,16 @@ if __name__ == "__main__":
 
     # print(dc.meta_dfs)
 
-    # test = AI_Data_Collection(
-    #     "/work/FAC/FGSE/IDYST/tbeucler/default/raw_data/AI-milton/panguweather"
-    # )
-    # datetimes = np.load(
-    #     "/work/FAC/FGSE/IDYST/tbeucler/default/milton/repos/alpha_bench/data/timestamps_sample.npy"
-    # )
-    # tst = test.retrieve_ds(datetimes)
+    test = AI_Data_Collection(
+        "/work/FAC/FGSE/IDYST/tbeucler/default/raw_data/TCBench_alpha/hugging/TCBench/neural_weather_models/panguweather"
+        # "/work/FAC/FGSE/IDYST/tbeucler/default/raw_data/AI-milton/panguweather"
+    )
+    datetimes = np.load(
+        "/work/FAC/FGSE/IDYST/tbeucler/default/milton/repos/alpha_bench/data/ramon_sample.npy"
+        # "/work/FAC/FGSE/IDYST/tbeucler/default/milton/repos/alpha_bench/data/timestamps_sample.npy"
+    )
+    datetimes = datetimes  # + np.timedelta64(366, "D")
+    tst = test.retrieve_ds(datetimes)
 
     # for i in range(tst.time.size // 4):
     #     fig = plt.figure()

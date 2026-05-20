@@ -1,7 +1,7 @@
 # Climatology Baseline Models
 # Date: 2024.05.24
-# This file contains the implementation of baseline models that output climatology.
-# Author: Milton Gomez
+# This file contains the implementation of baseline models for TCBench.
+# Author: mgomezd1
 # %% Imports
 # OS and IO
 import os
@@ -11,7 +11,6 @@ import matplotlib as mpl
 import numpy as np
 import dask.array as da
 import pandas as pd
-
 
 # ML Libraries
 import torch
@@ -1139,11 +1138,18 @@ class UNet_v2(UNet):
     def __init__(self, num_scalars, fc_width=512, cnn_widths=[32, 64, 128], **kwargs):
         super(UNet_v2, self).__init__(num_scalars, fc_width, cnn_widths, **kwargs)
 
-        # add a convolutional layer after the unet that outputs a single channel
-        self.conv_out = nn.Conv2d(cnn_widths[0], 1, kernel_size=1)
-        self.bn_out = nn.BatchNorm2d(1) if kwargs.get("batch_norm", True) else None
+        # Unet outchannels
+        self.unet_channels = kwargs.get("unet_channels", 4)
 
-        self.fc1 = nn.Linear(241 * 241, fc_width)
+        # add a convolutional layer after the unet that outputs a 4 channels
+        self.conv_out = nn.Conv2d(cnn_widths[0], self.unet_channels, kernel_size=1)
+        self.bn_out = (
+            nn.BatchNorm2d(self.unet_channels)
+            if kwargs.get("batch_norm", True)
+            else None
+        )
+
+        self.fc1 = nn.Linear(241 * 241 * 4, fc_width)
 
         self.dropout2d = kwargs.get("dropout2d", 0.5)
         self.dropout = kwargs.get("dropout", 0.5)
@@ -1216,6 +1222,108 @@ class UNet_v2(UNet):
         # Concatenate and final FC layer
         x = torch.cat([x, scalars], dim=1)
         x = self.fc4(x)
+        return x
+
+
+# %%
+class Prob_UNet(UNet_v2):
+    def __str__(self):
+        return "Prob_UNet"
+
+    def __init__(self, num_scalars, fc_width=512, cnn_widths=[32, 64, 128], **kwargs):
+        super(UNet_v2, self).__init__(num_scalars, fc_width, cnn_widths, **kwargs)
+
+        # Unet outchannels
+        self.unet_channels = kwargs.get("unet_channels", 4)
+
+        # add a convolutional layer after the unet that outputs a 4 channels
+        self.conv_out = nn.Conv2d(cnn_widths[0], self.unet_channels, kernel_size=1)
+        self.bn_out = (
+            nn.BatchNorm2d(self.unet_channels)
+            if kwargs.get("batch_norm", True)
+            else None
+        )
+
+        self.fc1 = nn.Linear(241 * 241 * 4, fc_width)
+
+        self.dropout2d = kwargs.get("dropout2d", 0.5)
+        self.dropout = kwargs.get("dropout", 0.5)
+
+        self.fc4 = nn.Linear(fc_width + num_scalars * 8, 2)  # branch_for_mean
+        self.fc5 = nn.Linear(fc_width + num_scalars * 8, 2)  # branch_for_std
+
+    def forward(self, x, scalars):
+        # Handle single item batches
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+
+        if scalars.dim() == 1:
+            scalars = scalars.unsqueeze(0)
+
+        # Encoder
+        enc1 = F.dropout2d(self.enc1(x), p=self.dropout2d)
+        x = self.pool(enc1)
+        enc2 = F.dropout2d(self.enc2(x), p=self.dropout2d)
+        x = self.pool(enc2)
+        enc3 = F.dropout2d(self.enc3(x), p=self.dropout2d)
+        x = self.pool(enc3)
+
+        # Bottleneck
+        x = F.dropout2d(self.bottleneck(x), p=self.dropout2d)
+
+        # Decoder
+        x = self.upconv3(x)
+        if x.size() != enc3.size():
+            x = F.interpolate(
+                x, size=enc3.size()[2:], mode="bilinear", align_corners=False
+            )
+        x = x + enc3  # Residual connection
+        x = self.dec3(x)
+        x = F.dropout2d(x, p=self.dropout2d)
+
+        x = self.upconv2(x)
+        if x.size() != enc2.size():
+            x = F.interpolate(
+                x, size=enc2.size()[2:], mode="bilinear", align_corners=False
+            )
+        x = x + enc2  # Residual connection
+        x = self.dec2(x)
+        x = F.dropout2d(x, p=self.dropout2d)
+
+        x = self.upconv1(x)
+        if x.size() != enc1.size():
+            x = F.interpolate(
+                x, size=enc1.size()[2:], mode="bilinear", align_corners=False
+            )
+        x = x + enc1  # Residual connection
+        x = self.dec1(x)
+        x = F.dropout2d(x, p=self.dropout2d)
+
+        # Convolve to output a single channel
+        x = self.conv_out(x)
+        if self.bn_out:
+            x = self.bn_out(x)
+        x = F.relu(x)
+        # make sure the output image is the right size
+        x = F.interpolate(x, size=(241, 241), mode="bilinear", align_corners=False)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+
+        # Scalar processing
+        scalars = F.relu(self.fc2(scalars))
+        scalars = torch.squeeze(F.dropout(F.relu(self.fc3(scalars)), p=self.dropout))
+
+        if scalars.dim() == 1:
+            scalars = scalars.unsqueeze(0)
+
+        # Concatenate and final FC layer
+        x = torch.cat([x, scalars], dim=1)
+        x_mean = self.fc4(x)
+        x_std = F.relu(self.fc5(x))
+
+        # Concatenate mean and std outputs
+        x = torch.cat([x_mean, x_std], dim=1)
+
         return x
 
 

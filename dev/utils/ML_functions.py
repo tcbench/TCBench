@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Apr 29 10:10:00 2024
-
-This file contains the data handling library - functions that will be
-used in other scripts to perform the data tasks associated with TCBench
-
 @author: mgomezd1
 """
 

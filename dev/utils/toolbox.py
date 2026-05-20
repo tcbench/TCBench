@@ -4,7 +4,8 @@
 Created on Fri Jun  9 10:45:42 2023
 
 This file contains a "toolbox" library - functions and constants that will be
-used in other scripts to perform the tasks associated with TCBench
+used in other scripts to perform tasks associated with TCBench and post-processing
+models
 
 @author: mgomezd1
 """
@@ -42,7 +43,8 @@ import hashlib
 try:
     from utils import constants, data_lib
 except:
-    import constants, data_lib
+    # import constants, data_lib
+    print("error")
 
 # Retrieve Repository Path
 repo_path = "/" + os.path.join(*os.getcwd().split("/")[:-1])
@@ -162,6 +164,27 @@ def axis_generator(**kwargs):
     lon_vector = np.unique(lon_vector)
 
     return lat_vector, lon_vector
+
+
+def regression_2_RI(track_df, **kwargs):
+    df_mode = kwargs.get("mode", "ibtracs")
+    if df_mode == "ibtracs":
+        cols = {
+            "SID": "SID",
+            "lat": "LAT",
+            "lon": "LON",
+            "initial_time": "ISO_TIME",
+        }
+    elif df_mode == "preds":
+        cols = {
+            "SID": "SID",
+            "lat": "lat",
+            "lon": "lon",
+            "initial_time": "Initial Time",
+            "valid_time": "Valid Time",
+        }
+    else:
+        raise ValueError(f"Invalid mode: {df_mode}. Expected 'ibtracs' or 'preds'.")
 
 
 def fnv1a_hash(data):
@@ -286,6 +309,51 @@ def haversine(latp, lonp, lat_list, lon_list, **kwargs):
     a = np.where(np.sqrt(a) <= 1, a, np.sign(a))
 
     return 2 * 6371 * np.arcsin(np.sqrt(a))
+
+
+def latlon_2_cartesian(lat, lon, **kwargs):
+    """
+    Convert latitude/longitude to simple equirectangular Cartesian coordinates
+    referenced to (0,0).
+
+    Parameters
+    ----------
+    lat : array-like
+        Latitude in degrees.
+    lon : array-like
+        Longitude in degrees.
+    radius : float, optional
+        Sphere radius in kilometers. Default is 6371 km.
+
+    Returns
+    -------
+    x, y : array-like
+        Cartesian coordinates in **kilometers**.
+
+    Notes
+    -----
+    Previous implementation incorrectly used `lon * lat` (both in degrees)
+    for the x-coordinate and omitted converting longitude to radians, which
+    led to values larger by several orders of magnitude and occasional
+    overflows. The corrected formula is:
+
+        x = R * cos(lat_rad) * lon_rad
+        y = R * lat_rad
+
+    which produces arc-length distances along the tangential directions in km.
+    """
+    radius = kwargs.get("radius", 6371.0)
+
+    lat = np.asarray(lat)
+    lon = np.asarray(lon)
+
+    lat_rad = np.radians(lat)
+    lon_rad = np.radians(lon)
+
+    x = radius * np.cos(lat_rad) * lon_rad
+    y = radius * lat_rad
+
+    return x, y
 
 
 # %%
@@ -1551,11 +1619,21 @@ def read_py_track_file(
 
 
 # Functions to sanitize timestamp data
-def sanitize_timestamps(timestamps, data, time_coord="time"):
+def sanitize_timestamps(timestamps, data, time_coord="time", **kwargs):
     # Sanitize timestamps because ibtracs includes unsual time steps,
     # e.g. 603781 (Katrina, 2005) includes 2005-08-25 22:30:00,
     # 2005-08-29 11:10:00, 2005-08-29 14:45:00
-    valid_steps = timestamps[np.isin(timestamps, data[time_coord].values)]
+
+    leadtime_coord = kwargs.get("leadtime_coord", None)
+    if leadtime_coord is not None:
+        base_stamps = data[time_coord].values[:, None]
+        lead_times = data[leadtime_coord].values
+        valid_stamps = base_stamps + lead_times.astype("timedelta64[h]").flatten()
+        ds_stamps = np.unique(np.hstack([base_stamps, valid_stamps]))
+    else:
+        ds_stamps = data[time_coord].values
+
+    valid_steps = timestamps[np.isin(timestamps, ds_stamps)]
 
     return valid_steps
 
@@ -2351,12 +2429,36 @@ class tc_track:
                 da_list = []
                 for var, [level, attrs] in vars_to_keep.items():
                     if level is not None:
-                        assert (
-                            type(level) == ds[level_coord].dtype
-                            and level in ds[level_coord].values
-                        ), f"Invalid level {level}. Make sure you select a single level for each data variable."
+                        # if isinstance(level, int) or isinstance(level, float):
+                        #     level = [level]
+                        # if len(level) == 1:
+                        #     assert (
+                        #         type(level[0]) == ds[level_coord].dtype
+                        #         and level in ds[level_coord].values
+                        #     ), f"Invalid level {level}. Make sure the correct level type and value are selected."
+                        # elif len(level) > 1:
+                        #     assert all(
+                        #         [
+                        #             (
+                        #                 type(lv) == ds[level_coord].dtype
+                        #                 and lv in ds[level_coord].values
+                        #             )
+                        #             for lv in level
+                        #         ]
+                        #     ), f"Invalid levels {level}. Make sure the correct level type and values are selected."
 
                         # TODO: Add support for multiple levels
+                        da = ds[var].sel({level_coord: level})
+
+                        # For each level, add a variable with the level appended to the variable name
+                        # if len(level) > 1:
+                        #     for lv in level:
+                        #         da = ds[var].sel({level_coord: lv})
+                        #         da = da.rename(f"{var}{lv}")
+                        #         da = da.drop_vars(level_coord)
+                        #         da.attrs = attrs
+                        #         da_list.append(da)
+                        # else:
                         da = ds[var].sel({level_coord: level})
                         da = da.rename(f"{var}{level}")
                         da = da.drop_vars(level_coord)
@@ -2695,8 +2797,12 @@ class tc_track:
 
         distances = list_to_list_haversine(initial_positions, end_positions)
 
-        lat_delta = np.abs(end_positions[:, 0] - initial_positions[:, 0])[:, None]
-        lon_delta = np.abs(end_positions[:, 1] - initial_positions[:, 1])[:, None]
+        if not kwargs.get("non_absolute", False):
+            lat_delta = np.abs(end_positions[:, 0] - initial_positions[:, 0])[:, None]
+            lon_delta = np.abs(end_positions[:, 1] - initial_positions[:, 1])[:, None]
+        else:
+            lat_delta = end_positions[:, 0] - initial_positions[:, 0]
+            lon_delta = end_positions[:, 1] - initial_positions[:, 1]
 
         return distances, lat_delta, lon_delta
 
@@ -3198,7 +3304,14 @@ class AI:
             # Get ground truth and valid timestamps
             gt, stamps = self.__parent.get_ground_truth(**kwargs)
 
-            valid_stamps = sanitize_timestamps(stamps, self.ds, time_coord)
+            ref_gt = gt.copy()
+            ref_stamps = stamps.copy()
+
+            valid_stamps = sanitize_timestamps(
+                stamps,
+                self.ds,
+                time_coord,  # leadtime_coord=leadtime_coord
+            )
 
             gt = gt[np.isin(stamps, valid_stamps)]
             stamps = stamps[np.isin(stamps, valid_stamps)]
@@ -3224,11 +3337,11 @@ class AI:
 
                 # make a boolean index to see what leadtime data we have a
                 # truth value for
-                bool_idx = np.isin(leadtimes, stamps)
+                bool_idx = np.isin(leadtimes, ref_stamps)
 
                 out_data = temp_ds.isel({leadtime_coord: bool_idx}).to_array().values
                 out_data = np.moveaxis(out_data, 0, 1)
-                out_targets = gt[np.isin(stamps, leadtimes[bool_idx])]
+                out_targets = ref_gt[np.isin(ref_stamps, leadtimes[bool_idx])]
                 # base_targets = gt[stamps == stamp]
                 temp_stamps = leadtimes[bool_idx]
                 temp_leads = temp_ds.isel({leadtime_coord: bool_idx})[
@@ -3351,7 +3464,8 @@ class AI:
         except Exception as e:
             if kwargs.get("verbose", False):
                 print(
-                    f"Error serving AI data for {self.__parent.uid} with model {self.model}"
+                    f"Error serving AI data for {self.__parent.uid} with model {self.model}",
+                    flush=True,
                 )
                 print(e)
             return None
@@ -3612,7 +3726,7 @@ class ReAnal:
                 self, "ds"
             ), f"ReAnal dataset not found for {self.__parent.uid} with model {self.model}"
 
-            (_, _, time_coord, _, _) = get_coord_vars(self.ds)
+            _, _, time_coord, _, _ = get_coord_vars(self.ds)
 
             # Get ground truth and valid timestamps
             gt, stamps = self.__parent.get_ground_truth(**kwargs)
@@ -4094,3 +4208,250 @@ class ReAnal:
     #     ax3d.invert_zaxis()
     #     fig.tight_layout()
     #     plt.show()
+
+
+# %% debugging with main
+if __name__ == "__main__":
+    import data_lib as dlib
+
+    # dc = AI_Data_Collection(
+    #     "/work/FAC/FGSE/IDYST/tbeucler/default/raw_data/AI-milton/panguweather"
+    # )
+    # print(dc.meta_dfs)
+
+    dc = dlib.AI_Data_Collection(
+        "/work/FAC/FGSE/IDYST/tbeucler/default/raw_data/TCBench_alpha/hugging/TCBench/neural_weather_models/panguweather"
+    )
+
+    data_dir = "/work/FAC/FGSE/IDYST/tbeucler/default/raw_data/TCBench_alpha"
+    seasons = get_TC_seasons(
+        season_list=[*range(2023, 2024)],
+        datadir_path=data_dir,
+    )
+    storms = seasons[2023]
+    for storm in storms:
+        if storm.uid == "2023326N10240":
+            break
+
+# === TCBench plotting helpers (evaluation CSV utilities) ===
+import re
+
+# Canonical metric name aliases used across legacy outputs
+METRIC_ALIASES = {
+    # Track geometry (CARTE)
+    "Along_TE": ["ATE", "along_te", "AlongTrackError"],
+    "Cross_TE": ["CTE", "cross_te", "CrossTrackError"],
+    "DPE_cart": ["CDPE", "dpe_cart", "cart_dpe"],
+    # Track displacement / CRPS
+    "DPE_GCD": ["DPE", "gcd_dpe"],
+    "CRPS_haversine": ["CRPS_track", "CRPS_DPE"],
+    # Intensity (wind)
+    "AE_wind": ["AE_vmax", "abserr_vmax", "AE_WIND"],
+    "SE_wind": ["SE_vmax", "sqerr_vmax", "SE_WIND"],
+    "CRPS_vmax": ["CRPS_wind", "CRPS_VMAX"],
+    # Intensity (pressure)
+    "AE_pressure": ["AE_pmin", "abserr_pmin", "AE_PRESSURE"],
+    "SE_pressure": ["SE_pmin", "sqerr_pmin", "SE_PRESSURE"],
+    "CRPS_pmin": ["CRPS_pressure", "CRPS_PMIN"],
+}
+
+
+def load_eval_csv(path: str) -> pd.DataFrame:
+    """Load a results CSV, parse timestamps, and add a `lead_hours` column.
+    Falls back to a 6‑hour multiple if Initial/Valid times are missing.
+    """
+    df = pd.read_csv(path, low_memory=False)
+    for c in ("Initial Time", "Valid Time"):
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    if {"Initial Time", "Valid Time"}.issubset(df.columns):
+        df["lead_hours"] = (
+            df["Valid Time"] - df["Initial Time"]
+        ).dt.total_seconds() / 3600.0
+    else:
+        # Best-effort fallback
+        if {"SID", "Initial Time"}.issubset(df.columns):
+            df["lead_hours"] = df.groupby(["SID", "Initial Time"]).cumcount() * 6.0
+        else:
+            df["lead_hours"] = np.arange(len(df)) * 6.0
+    return df
+
+
+def find_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Return the first matching column name from a list of candidates (case‑insensitive)."""
+    cols = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols:
+            return cols[c.lower()]
+    return None
+
+
+def pick_metric_col(df: pd.DataFrame, base: str) -> str | None:
+    """Return the column for a metric, favoring probabilistic means ("*_mean")
+    with robust fallbacks for legacy aliases. Also handles the legacy DPE name.
+    """
+    cols = {c.lower(): c for c in df.columns}
+    candidates: list[str] = [f"{base}_mean", base]
+    for alias in METRIC_ALIASES.get(base, []):
+        candidates.extend([f"{alias}_mean", alias])
+    if base == "DPE_GCD":
+        candidates.extend(["DPE_mean", "DPE"])  # legacy
+    for cand in candidates:
+        if cand and cand.lower() in cols:
+            return cols[cand.lower()]
+    return None
+
+
+# --- Helper: Compute per-lead R² by merging SE_* from results with IBTrACS GT
+def compute_r2_by_lead_from_results(
+    results_df: pd.DataFrame,
+    ibtracs_df: pd.DataFrame,
+    variable: str,  # "wind" or "pressure"
+    year: int | None = None,
+    debug: bool = False,
+) -> pd.Series:
+    """
+    R²(L) = 1 - mean(SE_variable at lead L) / Var(GT_variable at lead L)
+
+    Supports both deterministic and probabilistic results files:
+      • Prefer `SE_{variable}_mean` when present (ensemble-mean squared error)
+      • Else use `SE_{variable}`
+      • Else fall back to squaring `AE_{variable}_mean` or `AE_{variable}`
+
+    Assumes:
+      - results_df has: ["SID", "Initial Time", "Valid Time", <error cols>]
+      - ibtracs_df has: ["SID", "ISO_TIME", "USA_WIND", "USA_PRES"]
+    Returns a Series indexed by integer lead hours.
+    """
+    assert variable in {"wind", "pressure"}
+    gt_col = "USA_WIND" if variable == "wind" else "USA_PRES"
+
+    # ---- sanity checks for required ID/time columns
+    need_core = {"SID", "Initial Time", "Valid Time"}
+    if not need_core.issubset(results_df.columns):
+        missing = need_core - set(results_df.columns)
+        raise ValueError(f"results_df missing columns: {missing}")
+    need_ib = {"SID", "ISO_TIME", "USA_WIND", "USA_PRES"}
+    if not need_ib.issubset(ibtracs_df.columns):
+        missing = need_ib - set(ibtracs_df.columns)
+        raise ValueError(f"ibtracs_df missing columns: {missing}")
+
+    # ---- choose SE column (probabilistic-first) with robust fallbacks
+    # Try SE_*_mean, then SE_*, else derive from AE_* (or AE_*_mean)^2
+    se_pick = pick_metric_col(results_df, f"SE_{variable}")
+    ae_pick = None
+    src = None
+
+    if se_pick is not None:
+        src = "SE_mean" if se_pick.lower().endswith("_mean") else "SE"
+    else:
+        ae_pick = pick_metric_col(results_df, f"AE_{variable}")
+        if ae_pick is None:
+            tried = [
+                f"SE_{variable}_mean",
+                f"SE_{variable}",
+                f"AE_{variable}_mean",
+                f"AE_{variable}",
+            ]
+            raise ValueError(
+                f"No squared-error columns found for variable='{variable}'. Looked for: {tried}"
+            )
+        src = "AE_mean^2" if ae_pick.lower().endswith("_mean") else "AE^2"
+
+    # ---- normalize results times & compute/prepare SE column
+    m = results_df.copy()
+    m["Initial Time"] = pd.to_datetime(m["Initial Time"], errors="coerce")
+    m["Valid Time"] = pd.to_datetime(m["Valid Time"], errors="coerce")
+
+    if se_pick is not None:
+        se_col = se_pick
+        m[se_col] = pd.to_numeric(m[se_col], errors="coerce")
+    else:
+        # derive SE from AE
+        se_col = f"__SE_from_{ae_pick}"
+        m[se_col] = pd.to_numeric(m[ae_pick], errors="coerce") ** 2
+
+    before_drop = len(m)
+    m = m.dropna(subset=["SID", "Initial Time", "Valid Time", se_col]).copy()
+    if m.empty:
+        if debug:
+            print(f"[R2/{variable}] No usable rows after coercion/dropna.")
+        return pd.Series(dtype=float)
+
+    # integer lead (nearest hour)
+    m["lead_hours"] = (
+        ((m["Valid Time"] - m["Initial Time"]).dt.total_seconds() / 3600.0)
+        .round()
+        .astype(int)
+    )
+
+    # hour key for merge on valid time (naive, floored to hour → int64 hrs since epoch)
+    vt = m["Valid Time"]
+    try:
+        # if tz-aware, convert to naive; else leave as is
+        if getattr(vt.dt, "tz", None) is not None:
+            vt = vt.dt.tz_convert(None)
+    except Exception:
+        pass
+    m["valid_hr"] = vt.dt.floor("h").astype("int64") // 3_600_000_000_000
+
+    if debug:
+        print(f"[R2/{variable}] results: rows={before_drop:,} -> kept={len(m):,}")
+        print(
+            f"[R2/{variable}] using column '{se_col}' (source={src}) | dtype={m[se_col].dtype}"
+        )
+
+    # ---- IBTrACS: filter year, normalize time key, coerce GT
+    ib = ibtracs_df.copy()
+    ib["ISO_TIME"] = pd.to_datetime(ib["ISO_TIME"], errors="coerce")
+    if year is not None:
+        ib = ib[ib["ISO_TIME"].dt.year == year]
+    ib[gt_col] = pd.to_numeric(ib[gt_col], errors="coerce")
+    ib = ib.dropna(subset=["SID", "ISO_TIME", gt_col]).copy()
+
+    iso = ib["ISO_TIME"]
+    try:
+        if getattr(iso.dt, "tz", None) is not None:
+            iso = iso.dt.tz_convert(None)
+    except Exception:
+        pass
+    ib["iso_hr"] = iso.dt.floor("h").astype("int64") // 3_600_000_000_000
+
+    # ---- merge GT onto model rows by (SID, valid_hr)
+    merged = m.merge(
+        ib[["SID", "iso_hr", gt_col]].rename(columns={"iso_hr": "valid_hr"}),
+        on=["SID", "valid_hr"],
+        how="left",
+    )
+    use = merged.dropna(subset=[se_col, gt_col, "lead_hours"]).copy()
+    if debug:
+        total = len(merged)
+        have_gt = merged[gt_col].notna().sum()
+        pct = (have_gt / total * 100.0) if total else 0.0
+        print(
+            f"[R2/{variable}] merge: rows={total:,}; with GT={have_gt:,} ({pct:.1f}%)"
+        )
+        print(f"[R2/{variable}] usable rows: {len(use):,}")
+
+    if use.empty:
+        return pd.Series(dtype=float)
+
+    # ---- per-lead MSE and GT variance (sample variance)
+    g = use.groupby("lead_hours", dropna=False)
+    mse = g[se_col].mean()
+    var_gt = g[gt_col].var(ddof=1)
+
+    # compute R² safely; drop non-finite and clip to <= 1
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2 = 1.0 - (mse / var_gt)
+    r2 = r2.replace([np.inf, -np.inf], np.nan).dropna().clip(upper=1.0)
+    r2.name = f"R2_{variable}"
+
+    if debug:
+        try:
+            sample = list(zip(r2.index[:5], r2.values[:5]))
+        except Exception:
+            sample = []
+        print(f"[R2/{variable}] produced {r2.size} R² points; sample: {sample}")
+
+    return r2.sort_index()
