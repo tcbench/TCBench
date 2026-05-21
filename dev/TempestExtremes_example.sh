@@ -54,4 +54,3 @@ for f in $FLIST
 do
         track $f
 done
-
