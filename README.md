@@ -1,9 +1,9 @@
 # TCBench - Alpha Repository
  
-Welcome to TCBench, our platform and benchmark dataset for data-driven tropical cyclone studies. For more information on how to use the repository, please [check out the GitHub Wiki](https://github.com/msgomez06/TCBench_Alpha/wiki).
+Welcome to TCBench, our platform and benchmark dataset for data-driven tropical cyclone studies.
 
 Graphical Summary of TCBench:
-![TCBench Graphical Summary](https://github.com/msgomez06/TCBench_Alpha/blob/main/Figure_Summary.png?raw=True)
+![TCBench Graphical Summary](https://raw.githubusercontent.com/tcbench/TCBench/9d955ddb3a35ae326a8415cb4988a9d2bfec0dbf/Figure_Summary.png?raw=True)
 
 ## Background
 
@@ -27,24 +27,43 @@ In summary, TCBench aims to provide opportunities to study the predictability of
 
 ## Getting Started
 
-TCBench is in its initial stages, so it's currently not meant to be installed. The \_\_init\_\_ files have, however, been made and this might work. Give it a shot if you're feeling brave 😄
+Please refer to our getting started jupyter notebook: Getting_Started.ipynb. Special thanks to Samuel Darmon for his work on it.
 
 ### Folder Structure
 ```
-├── dev
-│   ├── __init__.py
-│   ├── primed_loader.py
-│   ├── track_loader.py
-│   ├── track_test.py
-│   └── utils
-│       ├── constants.py
-│       ├── __init__.py
-│       └── toolbox.py
+tcbench/
+├── .gitignore
 ├── __init__.py
+├── Figure_Summary.png
 ├── LICENSE
 ├── README.md
-└── tracks
+├── requirements.txt
+└── dev/
+    ├── __init__.py
+    ├── baselines.py
+    ├── climatology_maker.py
+    ├── compute_clim_results.py
+    ├── compute_persistence.py
+    ├── data_preprocessing.py
+    ├── eval_plotter.py
+    ├── evaluate_tracks.py
+    ├── evaluate_tracks_RI.py
+    ├── Getting_Started.ipynb
+    ├── metrics.py
+    ├── metrics_test.py
+    ├── plot_errors.py
+    ├── plot_RI.py
+    ├── postprocessing_model_dfBuilder.py
+    ├── postprocessing training (deep).py
+    ├── postprocessing training (linear).py
+    └── utils/
+        ├── __init__.py
+        ├── constants.py
+        ├── data_lib.py
+        ├── ML_functions.py
+        └── toolbox.py
+
 ```
-`\dev` contains all of the python scripts that you will need to test out TCBench's data preprocessing.  
-`\dev\utils\constants.py` holds reference values for the operations carried out by TCBench. This includes classes describing the tracks provided by, e.g., IBTrACS, which facilitate track processing.  
-`\dev\utils\toolbox.py` includes functions and classes used to process the tracks. Of note is the tc_track class, which is the current cornerstone of TCBench. 
+`\dev` contains all of the python scripts needed to evaluate your tracks. <br>
+`\dev\utils\constants.py` holds reference values for some operations carried out by TCBench. This includes classes describing the tracks provided by, e.g., IBTrACS, which facilitate track processing.  <br>
+`\dev\utils\toolbox.py` includes support functions and classes used during evaluation.
