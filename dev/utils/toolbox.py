@@ -47,7 +47,7 @@ except:
     print("error")
 
 # Retrieve Repository Path
-repo_path = "/" + os.path.join(*os.getcwd().split("/")[:-1])
+repo_path = os.sep + os.path.join(*os.getcwd().split(os.sep)[:-1])
 
 # print(repo_path)
 
