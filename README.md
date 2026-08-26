@@ -1,4 +1,4 @@
-# TCBench - Alpha Repository
+# TCBench - Repository
  
 Welcome to TCBench, our platform and benchmark dataset for data-driven tropical cyclone studies.
 

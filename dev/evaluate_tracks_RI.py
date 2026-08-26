@@ -116,7 +116,7 @@ def evaluate_tracks_RI(
     ibtracs_folder: str,
     results_folder: str,
     year: int = 2023,
-    RI_thresh: float = 34.0,
+    RI_thresh: float = 30.0,
     RI_window: int = 24,
     keep_intensification: bool = False,
     select_files: Optional[List[str]] = None,
@@ -377,7 +377,7 @@ if __name__ == "__main__":
     parser.add_argument("--ibtracs_folder", type=str, required=True)
     parser.add_argument("--results_folder", type=str, required=True)
     parser.add_argument("--year", type=int, default=2023)
-    parser.add_argument("--RI_thresh", type=float, default=34.0)
+    parser.add_argument("--RI_thresh", type=float, default=30.0)
     parser.add_argument("--RI_window", type=int, default=24)
     parser.add_argument("--keep_intensification", action="store_true")
     parser.add_argument("--recompute", action="store_true")

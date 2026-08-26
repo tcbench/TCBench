@@ -151,7 +151,7 @@ def evaluate_tracks(
                         ibtracs_folder=ibtracs_tracks_path,
                         results_folder=eval_folder,
                         year=year,
-                        RI_thresh=34.0,
+                        RI_thresh=30.0,
                         RI_window=24,
                         keep_intensification=False,
                         select_files=[track_file],
@@ -176,8 +176,10 @@ def evaluate_tracks(
         if _cols.duplicated().any():
             if verbose:
                 dups = list(_cols[_cols.duplicated(keep=False)])
-                print(f"Warning: duplicated columns in {track_file}: {dups} — keeping first.")
-            track_df = track_df.loc[:, ~_cols.duplicated(keep='first')]
+                print(
+                    f"Warning: duplicated columns in {track_file}: {dups} — keeping first."
+                )
+            track_df = track_df.loc[:, ~_cols.duplicated(keep="first")]
 
         # If post-processing file, normalize column names
         if postproc and "pres min" in track_df.columns:
@@ -305,7 +307,7 @@ def evaluate_tracks(
                     ibtracs_folder=ibtracs_tracks_path,
                     results_folder=eval_folder,
                     year=year,
-                    RI_thresh=34.0,
+                    RI_thresh=30.0,
                     RI_window=24,
                     keep_intensification=False,
                     select_files=[track_file],
