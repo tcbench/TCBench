@@ -14,7 +14,7 @@ from utils import data_lib as dlib
 import metrics_test as metrics
 
 try:
-    from evaluate_tracks_RI import evaluate_tracks_RI as _eval_RI
+    from evaluate_tracks_RI_rev import evaluate_tracks_RI as _eval_RI
 except Exception:
     _eval_RI = None
 
@@ -31,6 +31,7 @@ def evaluate_tracks(
     return_dataframes: bool = True,
     verbose: bool = True,
     ri_verbose: bool | None = False,
+    basin: str | None = None,
 ):
     """
     Evaluate track CSV files in `eval_folder`, compute metrics against IBTrACS, and
@@ -80,6 +81,16 @@ def evaluate_tracks(
     # --- Load IBTrACS and filter year
     ibtracs = toolbox.read_hist_track_file(tracks_path=ibtracs_tracks_path)
     ibtracs = ibtracs[pd.to_datetime(ibtracs["ISO_TIME"]).dt.year == year]
+    if basin is not None:
+        basin = basin.upper()
+        if basin not in ("SI", "SP", "NA", "NI", "WP", "EP"):
+            print(
+                f"⚠️ Basin '{basin}' not recognized. Processing all basins.",
+                flush=True,
+            )
+            basin = None
+        if basin is not None:
+            ibtracs = ibtracs[ibtracs["BASIN"] == basin]
 
     # --- Gather candidate files
     if select_files is None:
@@ -157,6 +168,7 @@ def evaluate_tracks(
                         select_files=[track_file],
                         recompute=recompute,
                         verbose=ri_verbose,
+                        basin=basin,
                     )
                 except Exception as e:
                     print(f"[RI] Warning: could not compute RI for {track_file}: {e}")
@@ -313,6 +325,7 @@ def evaluate_tracks(
                     select_files=[track_file],
                     recompute=recompute,
                     verbose=ri_verbose,
+                    basin=basin,
                 )
             except Exception as e:
                 print(f"[RI] Warning: could not compute RI for {track_file}: {e}")

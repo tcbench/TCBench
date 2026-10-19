@@ -123,6 +123,7 @@ def evaluate_tracks_RI(
     recompute: bool = False,
     verbose: bool = False,
     ri_verbose: bool | None = None,
+    basin: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Compute/ensure <name>_RI.csv files for model track CSVs in `results_folder`.
@@ -151,6 +152,9 @@ def evaluate_tracks_RI(
         Controls verbosity **inside the RI subroutine** only. If `None` (default),
         it mirrors `verbose`. Set `False` to suppress RI debug prints while keeping
         `evaluate_tracks` progress logs.
+    basin : str | None
+        Basin filter for IBTrACS coverage (e.g., 'SI', 'SP', 'NA', 'NI', 'WP', 'EP').
+        If not specified, all basins are included.
 
     Returns
     -------
@@ -162,6 +166,14 @@ def evaluate_tracks_RI(
     # --- Load and filter IBTrACS
     ib = toolbox.read_hist_track_file(tracks_path=ibtracs_folder)
     ib["ISO_TIME"] = _to_datetime(ib["ISO_TIME"])
+    if basin is not None:
+        basin_upper = basin.upper()
+        if basin_upper not in ["SI", "SP", "NA", "NI", "WP", "EP"]:
+            basin = None
+
+    if basin is not None:
+        ib = ib[ib["BASIN"] == basin].copy()
+
     ib = ib[ib["ISO_TIME"].dt.year == int(year)].copy()
 
     # Defensive: IBTrACS sometimes carries duplicate helper columns from prior merges
