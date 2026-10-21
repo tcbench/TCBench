@@ -499,6 +499,10 @@ def evaluate_tracks(
                 error_metrics.append(metrics.FairCRPS)
 
         if "lat" in results_df.columns and "lon" in results_df.columns:
+            # Col typing for sanity
+            results_df["lat"] = _to_numeric(results_df["lat"])
+            results_df["lon"] = _to_numeric(results_df["lon"])
+
             error_metrics.append(metrics.DirPosErr)
             error_metrics.append(metrics.CartPosErr)
             if ensemble_flag:
