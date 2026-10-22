@@ -21,6 +21,18 @@ from utils import data_lib as dlib
 import metrics_rev as metrics
 import re
 
+# %% Constants
+# Columns to keep for the baseline forecasts
+_BASELINE_COLS = [
+    "sid",
+    "initial_time",
+    "valid_time",
+    "wind_max",
+    "pressure_min",
+    "lat",
+    "lon",
+]
+
 
 # %% Helper Functions
 def _to_datetime(s: pd.Series) -> pd.Series:
@@ -95,16 +107,57 @@ def _col_typing(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = _to_numeric(df[col])
 
-    # Ensure boolean columns are in boolean format
+    # Ensure boolean columns are in float format
     if "RI" in df.columns:
-        df["RI"] = df["RI"].astype(bool)
+        df["RI"] = df["RI"].astype(float)
 
     return df
 
 
+def _baseline_prep(ibtracs: pd.DataFrame) -> pd.DataFrame:
+    """Filtering to the times of interest ( 00, 06, 12, 18 UTC) and ensuring
+    numeric types for the relevant columns, plus dropping duplicates and empty
+    rows.
+    """
+    ib = ibtracs[
+        ["SID", "ISO_TIME", "BASIN", "USA_WIND", "USA_PRES", "LAT", "LON"]
+    ].copy()
+    ib["ISO_TIME"] = _to_datetime(ib["ISO_TIME"])
+    for col in ["USA_WIND", "USA_PRES", "LAT", "LON"]:
+        ib[col] = _to_numeric(ib[col])
+    ib = ib[
+        ib["ISO_TIME"].dt.hour.isin([0, 6, 12, 18]) & (ib["ISO_TIME"].dt.minute == 0)
+    ]
+    ib = ib.dropna(subset=["USA_WIND", "USA_PRES", "LAT", "LON"], how="all")
+    return ib.drop_duplicates(subset=["SID", "ISO_TIME"]).reset_index(drop=True)
+
+
+def _expand_leads(inits: pd.DataFrame, max_lead_h: int) -> pd.DataFrame:
+    """Repeat each initial-time row for leads 6..max_lead_h h, adding lead_hours
+    and valid_time."""
+    inits = inits.reset_index(drop=True)
+    leads = np.arange(6, max_lead_h + 1, 6)
+    cases = inits.loc[inits.index.repeat(len(leads))].reset_index(drop=True)
+    cases["lead_hours"] = np.tile(leads, len(inits))
+    cases["valid_time"] = cases["initial_time"] + pd.to_timedelta(
+        cases["lead_hours"], unit="h"
+    )
+    return cases
+
+
+def _destination(lat, lon, brg_rad, dist_km, radius=6371.0):
+    """Point reached from (lat, lon) in degrees after dist_km along a great
+    circle with initial bearing brg_rad (radians clockwise from north)."""
+    p1, l1 = np.radians(lat), np.radians(lon)
+    d = np.asarray(dist_km, dtype=float) / radius
+    p2 = np.arcsin(np.sin(p1) * np.cos(d) + np.cos(p1) * np.sin(d) * np.cos(brg_rad))
+    l2 = l1 + np.arctan2(
+        np.sin(brg_rad) * np.sin(d) * np.cos(p1), np.cos(d) - np.sin(p1) * np.sin(p2)
+    )
+    return np.degrees(p2), np.degrees(l2)
+
+
 # %% Computing Functions
-
-
 def _ib_ref_builder(
     ibtracs_tracks_path: str, year: int, basin: str | None = None
 ) -> pd.DataFrame:
@@ -129,12 +182,252 @@ def _ib_ref_builder(
     return ib_ref
 
 
+def _build_clim_intensity(
+    ibtracs: pd.DataFrame,
+    out_path: str,
+    year: int,
+    train_years: tuple[int, int] = (1980, 2022),
+    max_lead_h: int = 120,
+    init_hours: tuple[int, ...] = (0, 12),
+    basin: str | None = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Climatology baseline for intensity, pressure and position.
+
+    For each basin and lead time, computes over all 6-hourly initial times in
+    train_years the mean change from the initial time to initial_time + lead of
+      - USA_WIND (kt) and USA_PRES (hPa)
+      - position, as eastward and northward displacement in km (local
+        equirectangular at the initial latitude, longitude wrapped)
+    Each case initialised in `year` is then forecast as its observed initial
+    value plus that mean change; the displacement is converted back to lat/lon
+    at the initial latitude. The basin is taken at the initial time. Only storms
+    still present in IBTrACS at the valid time contribute to the means. Each
+    variable is NaN where its initial value is missing.
+
+    Saves the forecasts (sid, initial_time, valid_time, wind_max, pressure_min,
+    lat, lon; lon in [0, 360)) to out_path and the means table (BASIN,
+    lead_hours, mean_dwind, n_wind, mean_dpres, n_pres, mean_dx_km, mean_dy_km,
+    n_pos) next to it with a '_means' suffix. Returns the forecasts.
+    """
+    radius = 6371.0  # km
+    if train_years[0] <= year <= train_years[1]:
+        print(
+            f"[CLIM] Warning: target year {year} lies inside the training period {train_years}."
+        )
+
+    ib = _baseline_prep(ibtracs)
+
+    # Observed values at any valid time
+    obs = ib.drop(columns="BASIN").rename(
+        columns={
+            "ISO_TIME": "valid_time",
+            "USA_WIND": "wind_v",
+            "USA_PRES": "pres_v",
+            "LAT": "lat_v",
+            "LON": "lon_v",
+        }
+    )
+
+    # (initial time x lead) cases for the training and target years
+    init_year = ib["ISO_TIME"].dt.year
+    inits = ib[init_year.between(*train_years) | (init_year == year)].rename(
+        columns={
+            "ISO_TIME": "initial_time",
+            "USA_WIND": "wind_0",
+            "USA_PRES": "pres_0",
+            "LAT": "lat_0",
+            "LON": "lon_0",
+        }
+    )
+    cases = _expand_leads(inits, max_lead_h)
+
+    # Mean changes by basin and lead time over the training period
+    train = cases[cases["initial_time"].dt.year.between(*train_years)].merge(
+        obs, on=["SID", "valid_time"], how="inner"
+    )
+    dlon = (train["lon_v"] - train["lon_0"] + 180) % 360 - 180
+    train = train.assign(
+        dwind=train["wind_v"] - train["wind_0"],
+        dpres=train["pres_v"] - train["pres_0"],
+        dx_km=radius * np.radians(dlon) * np.cos(np.radians(train["lat_0"])),
+        dy_km=radius * np.radians(train["lat_v"] - train["lat_0"]),
+    )
+    means = train.groupby(["BASIN", "lead_hours"], as_index=False).agg(
+        mean_dwind=("dwind", "mean"),
+        n_wind=("dwind", "count"),
+        mean_dpres=("dpres", "mean"),
+        n_pres=("dpres", "count"),
+        mean_dx_km=("dx_km", "mean"),
+        mean_dy_km=("dy_km", "mean"),
+        n_pos=("dy_km", "count"),
+    )
+
+    # Forecasts for the target year at the forecast initialisation hours
+    fc = cases[
+        (cases["initial_time"].dt.year == year)
+        & cases["initial_time"].dt.hour.isin(init_hours)
+    ]
+    if basin is not None and basin.upper() in ["SI", "SP", "NA", "NI", "WP", "EP"]:
+        fc = fc[fc["BASIN"] == basin.upper()]
+    fc = fc.merge(
+        means[
+            [
+                "BASIN",
+                "lead_hours",
+                "mean_dwind",
+                "mean_dpres",
+                "mean_dx_km",
+                "mean_dy_km",
+            ]
+        ],
+        on=["BASIN", "lead_hours"],
+        how="left",
+    )
+    fc["wind_max"] = (fc["wind_0"] + fc["mean_dwind"]).clip(lower=0).round(1)
+    fc["pressure_min"] = (fc["pres_0"] + fc["mean_dpres"]).round(1)
+    fc["lat"] = (
+        (fc["lat_0"] + np.degrees(fc["mean_dy_km"] / radius)).clip(-90, 90).round(2)
+    )
+    fc["lon"] = (
+        (
+            fc["lon_0"]
+            + np.degrees(fc["mean_dx_km"] / (radius * np.cos(np.radians(fc["lat_0"]))))
+        )
+        % 360
+    ).round(2)
+    fc = fc.rename(columns={"SID": "sid"})[_BASELINE_COLS]
+
+    fc.to_csv(out_path, index=False)
+    means_path = f"{os.path.splitext(out_path)[0]}_means.csv"
+    means.to_csv(means_path, index=False)
+    if verbose:
+        print(f"[CLIM] Saved baseline ({len(fc)} rows): {out_path}")
+        print(f"[CLIM] Saved mean change table: {means_path}")
+
+    return fc
+
+
+def _build_persistence_intensity(
+    ibtracs: pd.DataFrame,
+    out_path: str,
+    year: int,
+    max_lead_h: int = 120,
+    init_hours: tuple[int, ...] = (0, 12),
+    basin: str | None = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Persistence baseline for intensity, pressure and position.
+
+    Each case initialised in `year` is forecast as its observed USA_WIND and
+    USA_PRES at the initial time, held constant for every valid time out to
+    max_lead_h. The position persists the storm's forward motion: the speed and
+    heading from the storm's previous record to the initial time, extrapolated
+    along a great circle (constant speed, initial heading kept). A storm's first
+    record, or one whose previous position is missing, has zero motion. Each
+    variable is NaN where its initial value is missing. The basin filter uses
+    the basin at the initial time.
+
+    Saves the forecasts (sid, initial_time, valid_time, wind_max, pressure_min,
+    lat, lon; lon in [0, 360)) to out_path and returns them.
+    """
+    ib = _baseline_prep(ibtracs).sort_values(["SID", "ISO_TIME"])
+
+    # Forward motion from the previous record of the same storm. Computed before
+    # any year/hour filtering so the previous record is always available.
+    prev = ib.groupby("SID")[["ISO_TIME", "LAT", "LON"]].shift(1)
+    dt_h = (ib["ISO_TIME"] - prev["ISO_TIME"]).dt.total_seconds() / 3600
+    dist_km = metrics.haversine(
+        prev["LAT"].to_numpy(),
+        prev["LON"].to_numpy(),
+        ib["LAT"].to_numpy(),
+        ib["LON"].to_numpy(),
+    )
+    # Heading on arrival at the current fix: back-bearing to the previous fix, reversed
+    heading = (
+        metrics.bearing(
+            ib["LAT"].to_numpy(),
+            ib["LON"].to_numpy(),
+            prev["LAT"].to_numpy(),
+            prev["LON"].to_numpy(),
+        )
+        + np.pi
+    )
+    ib["speed_kmh"] = np.nan_to_num(dist_km / dt_h.to_numpy(), nan=0.0)
+    ib["heading"] = np.nan_to_num(heading, nan=0.0)
+
+    ib = ib[(ib["ISO_TIME"].dt.year == year) & ib["ISO_TIME"].dt.hour.isin(init_hours)]
+    if basin is not None and basin.upper() in ["SI", "SP", "NA", "NI", "WP", "EP"]:
+        ib = ib[ib["BASIN"] == basin.upper()]
+    inits = ib.rename(
+        columns={
+            "SID": "sid",
+            "ISO_TIME": "initial_time",
+            "USA_WIND": "wind_max",
+            "USA_PRES": "pressure_min",
+            "LAT": "lat",
+            "LON": "lon",
+        }
+    )
+    fc = _expand_leads(inits, max_lead_h)
+    lat, lon = _destination(
+        fc["lat"].to_numpy(),
+        fc["lon"].to_numpy(),
+        fc["heading"].to_numpy(),
+        fc["speed_kmh"].to_numpy() * fc["lead_hours"].to_numpy(),
+    )
+    fc["lat"] = np.round(lat, 2)
+    fc["lon"] = np.round(lon % 360, 2)
+    fc = fc[_BASELINE_COLS]
+
+    fc.to_csv(out_path, index=False)
+    if verbose:
+        print(f"[PERSIST] Saved baseline ({len(fc)} rows): {out_path}")
+
+    return fc
+
+
 def _fetch_ibtracs(
-    ibtracs_tracks_path: str, ibtracs_gt_path: str, year: int, basin: str | None = None
+    ibtracs_tracks_path: str,
+    ibtracs_gt_path: str,
+    year: int,
+    basin: str,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     # read the IBTrACS data
     ibtracs = toolbox.read_hist_track_file(tracks_path=ibtracs_tracks_path)
-    ibtracs = ibtracs[pd.to_datetime(ibtracs["ISO_TIME"]).dt.year == year]
+
+    # Climatology-persistence and persistence intensity baselines, saved next to
+    # the ground truth. The names avoid '_20xx' so _candidate_processing picks
+    # them up as models.
+    baseline_suffix = f"-y{year}{f'-{basin.upper()}' if basin else ''}.csv"
+    baseline_dir = os.path.dirname(ibtracs_gt_path)
+    _build_clim_intensity(
+        ibtracs,
+        os.path.join(baseline_dir, f"CLIM-intensity{baseline_suffix}"),
+        year=year,
+        basin=basin,
+        verbose=verbose,
+    )
+    _build_persistence_intensity(
+        ibtracs,
+        os.path.join(baseline_dir, f"PERSIST-intensity{baseline_suffix}"),
+        year=year,
+        basin=basin,
+        verbose=verbose,
+    )
+    # ensure correct typing
+    ibtracs["ISO_TIME"] = _to_datetime(ibtracs["ISO_TIME"])
+    ibtracs["USA_WIND"] = _to_numeric(ibtracs["USA_WIND"])
+    ibtracs["USA_PRES"] = _to_numeric(ibtracs["USA_PRES"])
+    # drop empty rows and duplicates
+    ibtracs = ibtracs.dropna(subset=["SID", "ISO_TIME"]).drop_duplicates(
+        subset=["SID", "ISO_TIME"]
+    )
+    ibtracs = ibtracs[ibtracs["ISO_TIME"].dt.year == year]
+
     ibtracs = _compute_ibtracs_RI(ibtracs, ri_thresh=30, ri_window_h=24)
 
     if basin is not None:
@@ -188,8 +481,8 @@ def _fetch_ibtracs(
 
     gt_df = gt_df.rename(columns={"SID": "sid"})
 
-    # Handle missing values for RI (if no matching valid_time in IBTrACS, set RI to False)
-    gt_df["RI"] = gt_df["RI"].fillna(False)
+    # RI stays NaN where there is no matching valid_time in IBTrACS, so those
+    # cases are excluded from RI verification rather than counted as non-RI
 
     # # If wind and pressure are nan, set lat and lon to nan as well (to avoid evaluating timestamps
     # # resulting from non-us agency sources, which may have lat/lon but no US reported intensity values)
@@ -208,7 +501,8 @@ def _compute_ibtracs_RI(
 ) -> pd.DataFrame:
     """
     Compute RI flags and intensification for IBTrACS itself.
-    Returns a copy with boolean 'RI' and float 'intensification'.
+    Returns a copy with float 'RI' (1/0, NaN where intensification is undefined)
+    and float 'intensification'.
     """
     ib = ib.copy()
     ib["ISO_TIME"] = _to_datetime(ib["ISO_TIME"])
@@ -253,10 +547,14 @@ def _compute_ibtracs_RI(
 
     ib = ib.merge(ref, on=["SID", "__ri_ref_time__"], how="left")
     ib["intensification"] = ib["USA_WIND"] - ib["__ri_ref_intensity__"]
-    ib["RI"] = ib["intensification"] >= float(ri_thresh)
+    # NaN where either intensity is missing (e.g. first ri_window_h after genesis)
+    ib["RI"] = np.where(
+        ib["intensification"].notna(),
+        ib["intensification"] >= float(ri_thresh),
+        np.nan,
+    )
 
     # Final dtypes (avoid pandas SettingWithCopy warnings downstream)
-    ib["RI"] = ib["RI"].astype(bool)
     ib["intensification"] = pd.to_numeric(ib["intensification"], errors="coerce")
 
     return ib.drop(columns=["__ri_ref_time__", "__ri_ref_intensity__"])
@@ -269,10 +567,17 @@ def _compute_RI(
     RI_window: int,
     ens_fraction: Optional[float] = 0.3,
     keep_intensification: bool = False,
+    min_member_frac: float = 0.3,
 ) -> pd.DataFrame:
     """
     Compute RI flags and intensification for a model track DataFrame.
-    Returns a copy with boolean 'RI' and float 'intensification'.
+    Returns a copy with float 'RI' (1/0, NaN where it cannot be computed) and
+    float 'intensification'.
+
+    For ensembles, RI is 1 if the fraction of members with a defined RI that
+    show RI is at least ens_fraction (or any member if None). Cases where fewer
+    than min_member_frac of the members have a defined RI are NaN, so missing
+    forecasts are excluded from verification rather than counted as non-RI.
     """
     out = df.copy()
 
@@ -311,31 +616,42 @@ def _compute_RI(
     # --- Conditional selection ---
     conditions = [
         out["t_ref"] > out["initial_time"],  # inside the forecast window
-        out["t_ref"] < out["initial_time"],
-    ]  # before initialization
+        out["t_ref"] <= out["initial_time"],  # at/before initialization
+    ]
     choices = [out["self_wind"], out["ib_wind"]]
     out["u_ref"] = np.select(conditions, choices, default=np.nan)
     out = out.drop(columns=["self_wind", "ib_wind"])
 
-    out["RI"] = False
-    out["intensification"] = np.nan
-
     out["intensification"] = out["wind_max"] - out["u_ref"]
-    out["RI"] = out["intensification"] >= float(RI_thresh)
+    # NaN where the forecast or reference intensity is missing
+    out["RI"] = np.where(
+        out["intensification"].notna(),
+        out["intensification"] >= float(RI_thresh),
+        np.nan,
+    )
 
     if ensemble_flag:
+        num_members = out["ensemble_idx"].nunique()
         summary = out.groupby(
             ["sid", "initial_time", "valid_time"], as_index=False
-        ).agg(RI_fraction=("RI", "mean"), intensification=("intensification", "max"))
+        ).agg(
+            RI_fraction=("RI", "mean"),  # mean over members with a defined RI
+            n_valid=("RI", "count"),
+            intensification=("intensification", "max"),
+        )
 
         if ens_fraction is not None:
-            summary["RI"] = summary["RI_fraction"] >= ens_fraction
+            ri_flag = summary["RI_fraction"] >= ens_fraction
         else:
-            summary["RI"] = summary["RI_fraction"] > 0.0
+            ri_flag = summary["RI_fraction"] > 0.0
+        undefined = summary["RI_fraction"].isna() | (
+            summary["n_valid"] / num_members < min_member_frac
+        )
+        summary["RI"] = np.where(undefined, np.nan, ri_flag.astype(float))
 
         if not keep_intensification:
             summary.drop(columns=["intensification"], inplace=True)
-            summary.drop(columns=["RI_fraction"], inplace=True)
+            summary.drop(columns=["RI_fraction", "n_valid"], inplace=True)
         out = summary
 
     else:
@@ -347,23 +663,51 @@ def _compute_RI(
 
 
 def _evaluate_metrics(
-    results_df: pd.DataFrame,
     ground_truth_df: pd.DataFrame,
-    error_metrics: list,
-    ensemble_flag: bool = False,
+    prediction_df: pd.DataFrame,
+    deterministic_metrics: list = None,
+    probabilistic_metrics: list = None,
     verbose: bool = True,
 ) -> dict:
     """
     Evaluate the specified metrics on the results DataFrame.
-    Returns a dictionary of metric names and their computed values.
+    Returns the computed deterministic and probabilistic metrics
+    in their respective dataframes.
     """
+    deterministic_df = None
+    probabilistic_df = None
 
-    for metric in error_metrics:
-        try:
-            metric_name = metric.__name__
+    if deterministic_metrics:
+        for eval_metric in deterministic_metrics:
+            try:
+                if deterministic_df is None:
+                    deterministic_df = eval_metric(ground_truth_df, prediction_df)
+                else:
+                    deterministic_df = eval_metric(ground_truth_df, deterministic_df)
 
-        except Exception as e:
-            print(f"[ERROR] Failed to compute {metric.__name__}: {e}")
+            except Exception as e:
+                print(f"[ERROR] Failed to compute {eval_metric.__name__}: {e}")
+
+    if probabilistic_metrics:
+        for eval_metric in probabilistic_metrics:
+            try:
+                if probabilistic_df is None:
+                    probabilistic_df = eval_metric(ground_truth_df, prediction_df)
+                else:
+                    temp_df = eval_metric(ground_truth_df, prediction_df)
+                    # Append only the columns probabilistic_df does not have yet
+                    # (e.g. lead_hours, member_frac are shared across metrics)
+                    keys = ["sid", "initial_time", "valid_time"]
+                    new_cols = [
+                        c for c in temp_df.columns if c not in probabilistic_df.columns
+                    ]
+                    probabilistic_df = probabilistic_df.merge(
+                        temp_df[keys + new_cols], on=keys, how="left"
+                    )
+            except Exception as e:
+                print(f"[ERROR] Failed to compute {eval_metric.__name__}: {e}")
+
+    return deterministic_df, probabilistic_df
 
     return
 
@@ -377,10 +721,10 @@ def evaluate_tracks(
     recompute: bool = False,
     # only_ri: bool = False,
     # exclude_patterns: tuple[str, ...] = ("RI", "results", "ibtracs", "tracks"),
-    save_results: bool = True,
-    return_dataframes: bool = True,
+    # save_results: bool = True,
+    # return_dataframes: bool = True,
     verbose: bool = True,
-    ri_verbose: bool | None = False,
+    # ri_verbose: bool | None = False,
     basin: str | None = None,
 ):
     """
@@ -395,16 +739,15 @@ def evaluate_tracks(
     ibtracs_gt_path = os.path.join(eval_directory, f"ibtracs_gt{save_suffix}.csv")
 
     ib_ref = _ib_ref_builder(ibtracs_tracks_path, year, basin=basin)
-
     if not recompute:
         # check if the ibtracs ground truth data exists in the eval_directory
         if os.path.exists(ibtracs_gt_path):
             # If the data exists, load it
-            ibtracs = pd.read_csv(ibtracs_gt_path)
+            ibtracs = pd.read_csv(ibtracs_gt_path, dtype={"sid": str})
             ibtracs = _col_typing(ibtracs)
-        else:
-            # If the data doesn't exist, compute it
-            ibtracs = None
+    else:
+        # If the data doesn't exist, compute it
+        ibtracs = None
 
     if ibtracs is None:
         ibtracs = _fetch_ibtracs(
@@ -427,13 +770,18 @@ def evaluate_tracks(
     track_files.sort()
 
     for track_file in track_files:
+
+        if verbose:
+            print(
+                f"[INFO] Evaluating track file: {track_file} against IBTrACS ground truth."
+            )
         """
         Evaluate a single track file against the IBTrACS ground truth.
         Note that basin filtering is applied to the IBTrACS data, whose keys
         are used to match against the reported tracks. Thus, the basin filter
         is applied to the model predictions indirectly through the IBTrACS data.
         """
-        reported_tracks = pd.read_csv(track_file)
+        reported_tracks = pd.read_csv(track_file, dtype={"sid": str})
         reported_tracks = _col_typing(reported_tracks)
 
         # filter to the specified year - cuts down on computation when merging
@@ -480,7 +828,14 @@ def evaluate_tracks(
             )
 
         # blank metrics list to populate with the metrics to calculate
-        error_metrics = []
+        deterministic_metrics = []
+        probabilistic_metrics = []
+
+        if "wind_max" in results_df.columns or "pressure_min" in results_df.columns:
+            deterministic_metrics.append(metrics.AbsErr)
+            deterministic_metrics.append(metrics.SquErr)
+            if ensemble_flag:
+                probabilistic_metrics.append(metrics.FairCRPS)
 
         if "wind_max" in results_df.columns:
             # Compute RI and intensification only if wind_max is present
@@ -493,28 +848,59 @@ def evaluate_tracks(
                 keep_intensification=True,
             )
 
-            error_metrics.append(metrics.AbsErr)
-            error_metrics.append(metrics.SquErr)
-            if ensemble_flag:
-                error_metrics.append(metrics.FairCRPS)
-
         if "lat" in results_df.columns and "lon" in results_df.columns:
             # Col typing for sanity
             results_df["lat"] = _to_numeric(results_df["lat"])
             results_df["lon"] = _to_numeric(results_df["lon"])
 
-            error_metrics.append(metrics.DirPosErr)
-            error_metrics.append(metrics.CartPosErr)
+            deterministic_metrics.append(metrics.DirPosErr)
+            deterministic_metrics.append(metrics.CartPosErr)
             if ensemble_flag:
-                error_metrics.append(metrics.TrackCRPS)
+                probabilistic_metrics.append(metrics.TrackCRPS)
+                probabilistic_metrics.append(metrics.ProbCircle)
 
-        results = _evaluate_metrics(
-            results_df,
+        if not deterministic_metrics and not probabilistic_metrics:
+            print(
+                f"[INFO] No valid metrics to compute for {track_file} found.",
+                "Check if the required columns are present in the track file.",
+                "Skipping this file.",
+            )
+            continue
+
+        det_df, prob_df = _evaluate_metrics(
             ground_truth_df=ibtracs,
-            error_metrics=error_metrics,
-            ensemble_flag=ensemble_flag,
+            prediction_df=results_df,
+            deterministic_metrics=deterministic_metrics,
+            probabilistic_metrics=probabilistic_metrics,
             verbose=verbose,
         )
+
+        if det_df is not None:
+            det_out_path = os.path.join(
+                eval_directory,
+                f"{os.path.splitext(os.path.basename(track_file))[0]}_det{save_suffix}.csv",
+            )
+            det_df.to_csv(det_out_path, index=False)
+            if verbose:
+                print(f"[INFO] Saved deterministic metrics to {det_out_path}")
+
+        if prob_df is not None:
+            prob_out_path = os.path.join(
+                eval_directory,
+                f"{os.path.splitext(os.path.basename(track_file))[0]}_prob{save_suffix}.csv",
+            )
+            prob_df.to_csv(prob_out_path, index=False)
+            if verbose:
+                print(f"[INFO] Saved probabilistic metrics to {prob_out_path}")
+
+        if ri_results_df is not None:
+            ri_results_path = os.path.join(
+                eval_directory,
+                f"{os.path.splitext(os.path.basename(track_file))[0]}_ri{save_suffix}.csv",
+            )
+            ri_results_df.to_csv(ri_results_path, index=False)
+            if verbose:
+                print(f"[INFO] Saved RI results to {ri_results_path}")
 
 
 # %% Testing
@@ -523,7 +909,7 @@ if __name__ == "__main__":
     eval_directory = "/home/mgomezd1/repos/idea_testing/outputs_rev"
     ibtracs_tracks_path = "/home/mgomezd1/repos/idea_testing/ibtracs"
     year = 2023
-    recompute = False
+    recompute = True
     basin = None
     verbose = True
     select_files = None
@@ -532,8 +918,6 @@ if __name__ == "__main__":
     evaluate_tracks(
         eval_directory,
         ibtracs_tracks_path,
-        save_results=True,
-        only_ri=False,
         lead_hours=lead_hours,
         year=year,
         recompute=recompute,
@@ -541,3 +925,5 @@ if __name__ == "__main__":
         verbose=verbose,
         select_files=select_files,
     )
+
+# %%
