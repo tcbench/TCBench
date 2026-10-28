@@ -797,6 +797,12 @@ def BrierSS(
     the group columns numeric.
     climatology (float): Fixed reference probability, e.g. a long-term base rate,
     in lieu of the sample base rate. Default None.
+    reference_forecast (pd.DataFrame): Reference forecast, e.g. a climatology
+    baseline's RI results, in lieu of a constant reference probability. It is
+    scored on the same cases as the forecast; cases it does not cover are
+    excluded. Takes precedence over climatology. Default None.
+    reference_prob_col (str): Probability column of reference_forecast. Default
+    'RI_fraction' if present, else target_col (deterministic 0/1).
     fair (bool): Use the fair Brier score for finite ensembles (Ferro, 2014),
     (p - o)^2 - p (1 - p) / (m - 1), with m from count_col (default 'n_valid').
     Ensembles only; cases with m < 2 are excluded. Default False.
@@ -808,6 +814,7 @@ def BrierSS(
     """
     group_cols = kwargs.get("group_cols", ["lead_hours"])
     climatology = kwargs.get("climatology", None)
+    reference_forecast = kwargs.get("reference_forecast", None)
     fair = kwargs.get("fair", False)
     decimals = kwargs.get("decimals", 4)
 
@@ -819,6 +826,36 @@ def BrierSS(
             )
         df = df[df["_m"] >= 2]
 
+    if reference_forecast is not None:
+        col_keys = kwargs.get(
+            "column_keys",
+            {
+                "storm_id": "sid",
+                "initial_time": "initial_time",
+                "valid_time": "valid_time",
+            },
+        )
+        ref_keys = _get_refkeys(col_keys, forecast_df)
+        ref_prob_col = kwargs.get("reference_prob_col", None)
+        if ref_prob_col is None:
+            ref_prob_col = (
+                "RI_fraction"
+                if "RI_fraction" in reference_forecast.columns
+                else kwargs.get("target_col", "RI")
+            )
+        if ref_prob_col not in reference_forecast.columns:
+            raise ValueError(
+                f"Missing probability column '{ref_prob_col}' in reference_forecast."
+            )
+        df = df.merge(
+            reference_forecast[[*ref_keys, ref_prob_col]]
+            .drop_duplicates(subset=ref_keys)
+            .rename(columns={ref_prob_col: "_pref"}),
+            on=ref_keys,
+            how="left",
+        )
+        df = df[df["_pref"].notna()]
+
     def score(g):
         p = g["_p"].to_numpy(dtype=float)
         o = g["_o"].to_numpy(dtype=float)
@@ -827,7 +864,10 @@ def BrierSS(
         if fair:
             bs_i = bs_i - p * (1 - p) / (g["_m"].to_numpy(dtype=float) - 1)
         base_rate = o.mean() if n else np.nan
-        if climatology is None:
+        if reference_forecast is not None:
+            p_ref = g["_pref"].to_numpy(dtype=float)
+            bs_ref = np.mean((p_ref - o) ** 2) if n else np.nan
+        elif climatology is None:
             bs_ref = base_rate * (1 - base_rate)
         else:
             bs_ref = np.mean((climatology - o) ** 2) if n else np.nan
@@ -967,6 +1007,176 @@ def CSI(
     out = pd.concat(outs, ignore_index=True)
     out["prob_col"] = prob_col
     return out
+
+
+def PeirceSS(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Peirce skill score (Hanssen-Kuipers discriminant, true skill statistic)
+    for a binary event (default: RI).
+
+    PSS = POD - POFD = (hits * cn - false_alarms * misses)
+                       / ((hits + misses) * (false_alarms + cn))
+
+    A case is forecast as an event when its probability is >= threshold, as in
+    CSI. PSS ranges from -1 to 1, with 0 for random or constant forecasts and 1
+    for perfect ones. Unlike the CSI it rewards correct negatives and does not
+    depend on the base rate, though for rare events it tends to favour
+    overforecasting, since false alarms are diluted by the many non-events.
+    Cases where either the probability or the outcome is NaN are excluded.
+
+    Additional arguments:
+    threshold (float or sequence): Probability threshold(s) for a yes forecast.
+    Several thresholds give one row per threshold and group. Default 0.3.
+    prob_col (str): Forecast probability column. Default 'RI_fraction' if present,
+    else 'RI' (deterministic 0/1).
+    target_col (str): Observed outcome column (1/0/NaN). Default 'RI'.
+    group_cols (list): Columns to score separately. Default ['lead_hours'];
+    an empty list scores all cases together.
+    include_overall (bool): Append a row scoring all cases pooled, with the group
+    columns set to overall_label. Default True.
+    overall_label: Group value of the pooled row. Default 'all'; np.nan keeps
+    the group columns numeric.
+
+    Returns:
+        pd.DataFrame: One row per group and threshold with the contingency counts
+        (hits, misses, false_alarms, correct_negatives), POD, POFD, PSS and the
+        probability column scored. PSS is NaN where a group has no events or no
+        non-events.
+    """
+    group_cols = kwargs.get("group_cols", ["lead_hours"])
+    thresholds = np.atleast_1d(kwargs.get("threshold", 0.3)).astype(float)
+    decimals = kwargs.get("decimals", 4)
+
+    df, prob_col = _binary_eval_df(reference_df, forecast_df, kwargs)
+
+    def ratio(num, den):
+        return num / den if den > 0 else np.nan
+
+    outs = []
+    for thr in thresholds:
+
+        def score(g):
+            yes_f = g["_p"].to_numpy(dtype=float) >= thr
+            yes_o = g["_o"].to_numpy(dtype=float) == 1
+            hits = int(np.sum(yes_f & yes_o))
+            misses = int(np.sum(~yes_f & yes_o))
+            false_alarms = int(np.sum(yes_f & ~yes_o))
+            correct_negatives = int(np.sum(~yes_f & ~yes_o))
+            pod = ratio(hits, hits + misses)
+            pofd = ratio(false_alarms, false_alarms + correct_negatives)
+            return {
+                "n": len(yes_o),
+                "hits": hits,
+                "misses": misses,
+                "false_alarms": false_alarms,
+                "correct_negatives": correct_negatives,
+                "POD": np.round(pod, decimals),
+                "POFD": np.round(pofd, decimals),
+                "PSS": np.round(pod - pofd, decimals),
+            }
+
+        res = _score_groups(df, group_cols, score, kwargs)
+        res.insert(min(len(group_cols or []), res.shape[1]), "threshold", thr)
+        outs.append(res)
+
+    out = pd.concat(outs, ignore_index=True)
+    out["prob_col"] = prob_col
+    return out
+
+
+# %% Aggregate deterministic metrics
+def RSquared(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Coefficient of determination of the forecasts against the reference.
+
+    R^2 = 1 - SSE / SST,  SSE = sum (f - o)^2,  SST = sum (o - o_bar)^2
+
+    computed over the cases of each group (default: per lead time), with o_bar
+    the reference mean of that group. R^2 is 1 for perfect forecasts, 0 for a
+    forecast no better than the group's reference mean, and negative for worse.
+    Unlike the squared Pearson correlation it penalises bias and amplitude
+    errors. Ensemble members are pooled, each member-case pair counting once.
+    Cases where either the forecast or the reference is NaN are excluded.
+
+    Args:
+        reference_df (pd.DataFrame): DataFrame containing the reference values.
+        forecast_df (pd.DataFrame): DataFrame containing the forecast values.
+        **kwargs: Additional keyword arguments
+
+        Additional arguments:
+        column_keys (dict): Dictionary mapping columns containing the initial time,
+        valid time, and storm ID.
+
+        target_cols (list): Columns to evaluate; those missing from either
+        DataFrame are skipped. Default is ['wind_max', 'pressure_min']
+
+        method (str): 'determination' (default) for 1 - SSE/SST, or 'pearson'
+        for the squared Pearson correlation.
+
+        group_cols (list): Columns to score separately. Default ['lead_hours'];
+        an empty list scores all cases together.
+        include_overall (bool): Append a row scoring all cases pooled, with the group
+        columns set to overall_label. Default True.
+        overall_label: Group value of the pooled row. Default 'all'; np.nan keeps
+        the group columns numeric.
+
+    Returns:
+        pd.DataFrame: One row per group with n_<col> and RSquared_<col> per
+        target. RSquared is NaN where fewer than 2 cases or the reference has no
+        variance.
+    """
+    col_keys = kwargs.get(
+        "column_keys",
+        {
+            "storm_id": "sid",
+            "initial_time": "initial_time",
+            "valid_time": "valid_time",
+            "ensemble_idx": "ensemble_idx",
+            "lead_hours": "lead_hours",
+        },
+    )
+    ref_keys = _get_refkeys(col_keys, forecast_df)
+    target_cols = [
+        c
+        for c in kwargs.get("target_cols", ["wind_max", "pressure_min"])
+        if c in forecast_df.columns and c in reference_df.columns
+    ]
+    method = kwargs.get("method", "determination")
+    if method not in ("determination", "pearson"):
+        raise ValueError("method must be 'determination' or 'pearson'.")
+    group_cols = kwargs.get("group_cols", ["lead_hours"])
+    decimals = kwargs.get("decimals", 4)
+
+    eval_df = forecast_df[[*ref_keys, *target_cols]].merge(
+        reference_df[[*ref_keys, *target_cols]].drop_duplicates(subset=ref_keys),
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
+    )
+    eval_df = _add_lead_hours(eval_df, col_keys)
+
+    def score(g):
+        out = {}
+        for col in target_cols:
+            f = g[f"{col}_fcst"].to_numpy(dtype=float)
+            o = g[f"{col}_ref"].to_numpy(dtype=float)
+            valid = ~np.isnan(f) & ~np.isnan(o)
+            f, o = f[valid], o[valid]
+            n = len(o)
+            r2 = np.nan
+            if n >= 2:
+                sst = np.sum((o - o.mean()) ** 2)
+                if method == "determination" and sst > 0:
+                    r2 = 1 - np.sum((f - o) ** 2) / sst
+                elif method == "pearson" and sst > 0 and np.std(f) > 0:
+                    r2 = np.corrcoef(f, o)[0, 1] ** 2
+            out[f"n_{col}"] = n
+            out[f"RSquared_{col}"] = np.round(r2, decimals)
+        return out
+
+    return _score_groups(eval_df, group_cols, score, kwargs)
 
 
 # %%

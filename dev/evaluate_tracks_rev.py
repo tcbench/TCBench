@@ -461,8 +461,12 @@ def _fetch_ibtracs(
     ).astype(int)
 
     # Filter gt_df initial times to only those at 00 and 12 UTC
-    # (to match conventions for forecasting)
-    gt_df = gt_df[gt_df["initial_time"].dt.hour.isin([0, 12])].copy()
+    # (to match conventions for forecasting); off-synoptic IBTrACS records
+    # (e.g. landfall at 12:45) are not initial times
+    gt_df = gt_df[
+        gt_df["initial_time"].dt.hour.isin([0, 12])
+        & (gt_df["initial_time"].dt.minute == 0)
+    ].copy()
 
     gt_df = gt_df.merge(
         ibtracs.rename(
@@ -574,10 +578,12 @@ def _compute_RI(
     Returns a copy with float 'RI' (1/0, NaN where it cannot be computed) and
     float 'intensification'.
 
-    For ensembles, RI is 1 if the fraction of members with a defined RI that
-    show RI is at least ens_fraction (or any member if None). Cases where fewer
-    than min_member_frac of the members have a defined RI are NaN, so missing
-    forecasts are excluded from verification rather than counted as non-RI.
+    For ensembles, RI_fraction is the number of members showing RI over the
+    total number of members (members without a defined RI count as non-RI),
+    and RI is 1 if RI_fraction is at least ens_fraction (or any member if
+    None). Cases where fewer than min_member_frac of the members have a defined
+    RI are NaN, so missing forecasts are excluded from verification rather than
+    counted as non-RI; RI_fraction is NaN where no member has a defined RI.
     """
     out = df.copy()
 
@@ -635,10 +641,15 @@ def _compute_RI(
         summary = out.groupby(
             ["sid", "initial_time", "valid_time"], as_index=False
         ).agg(
-            RI_fraction=("RI", "mean"),  # mean over members with a defined RI
+            n_ri=("RI", "sum"),
             n_valid=("RI", "count"),
             intensification=("intensification", "max"),
         )
+        # Fraction over all members, not only those with a defined RI
+        summary["RI_fraction"] = (summary["n_ri"] / num_members).where(
+            summary["n_valid"] > 0
+        )
+        summary.drop(columns=["n_ri"], inplace=True)
 
         if ens_fraction is not None:
             ri_flag = summary["RI_fraction"] >= ens_fraction

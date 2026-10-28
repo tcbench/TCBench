@@ -149,8 +149,8 @@ for file in days:
             df = pd.concat([df, temp_df], ignore_index=True)
 
 # %%
-# convert wind to knots
-df["wind max"] = df["wind max"] * 1.94384
+# convert wind to knots, and scale by dividing by 0.88 to convert from 10m wind to 1-min sustained wind
+df["wind max"] = df["wind max"] * 1.94384 / 0.88
 # convert pressure to hPa
 df["pressure min"] = df["pressure min"] / 100
 
