@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import pandas as pd
 import numpy as np
+import yaml
 
 
 from utils import toolbox
@@ -22,6 +23,10 @@ import metrics_rev as metrics
 import re
 
 # %% Constants
+# Evaluation configuration (paths, year, basin, lead times, thresholds),
+# editable in a YAML file
+CONFIG_PATH = os.path.join(_DEV_FOLDER, "evaluate_tracks_config.yaml")
+
 # Columns to keep for the baseline forecasts
 _BASELINE_COLS = [
     "sid",
@@ -673,12 +678,39 @@ def _compute_RI(
     return out
 
 
+def _mask_low_member_frac(
+    df: pd.DataFrame,
+    num_members: int,
+    ensemble_fraction: float = 0.3,
+    key_cols: list[str] = ["sid", "initial_time", "valid_time"],
+    var_groups: list[list[str]] = [["wind_max"], ["pressure_min"], ["lat", "lon"]],
+) -> pd.DataFrame:
+    """
+    Set ensemble predictions to NaN for cases where the fraction of members
+    with a valid value is below ensemble_fraction. Each variable group is
+    masked independently (lat/lon jointly, as a member needs both for a
+    position), so e.g. a case can keep its wind_max while losing its position.
+    """
+    out = df.copy()
+    for group in var_groups:
+        cols = [c for c in group if c in out.columns]
+        if not cols:
+            continue
+        valid = out[cols].notna().all(axis=1)
+        member_frac = valid.groupby([out[k] for k in key_cols]).transform("sum") / (
+            num_members
+        )
+        out.loc[member_frac < ensemble_fraction, cols] = np.nan
+    return out
+
+
 def _evaluate_metrics(
     ground_truth_df: pd.DataFrame,
     prediction_df: pd.DataFrame,
     deterministic_metrics: list = None,
     probabilistic_metrics: list = None,
     verbose: bool = True,
+    ensemble_fraction: float = 0.3,
 ) -> dict:
     """
     Evaluate the specified metrics on the results DataFrame.
@@ -703,9 +735,17 @@ def _evaluate_metrics(
         for eval_metric in probabilistic_metrics:
             try:
                 if probabilistic_df is None:
-                    probabilistic_df = eval_metric(ground_truth_df, prediction_df)
+                    probabilistic_df = eval_metric(
+                        ground_truth_df,
+                        prediction_df,
+                        ensemble_fraction=ensemble_fraction,
+                    )
                 else:
-                    temp_df = eval_metric(ground_truth_df, prediction_df)
+                    temp_df = eval_metric(
+                        ground_truth_df,
+                        prediction_df,
+                        ensemble_fraction=ensemble_fraction,
+                    )
                     # Append only the columns probabilistic_df does not have yet
                     # (e.g. lead_hours, member_frac are shared across metrics)
                     keys = ["sid", "initial_time", "valid_time"]
@@ -737,6 +777,10 @@ def evaluate_tracks(
     verbose: bool = True,
     # ri_verbose: bool | None = False,
     basin: str | None = None,
+    ensemble_fraction: float = 0.3,
+    ri_thresh: float = 30,
+    ri_window: int = 24,
+    ri_ens_fraction: float = 0.3,
 ):
     """
     Evaluate model track files against IBTrACS ground truth.
@@ -853,9 +897,9 @@ def evaluate_tracks(
             ri_results_df = _compute_RI(
                 results_df,
                 ib_ref,
-                RI_thresh=30,
-                RI_window=24,
-                ens_fraction=0.3 if ensemble_flag else None,
+                RI_thresh=ri_thresh,
+                RI_window=ri_window,
+                ens_fraction=ri_ens_fraction if ensemble_flag else None,
                 keep_intensification=True,
             )
 
@@ -878,12 +922,19 @@ def evaluate_tracks(
             )
             continue
 
+        if ensemble_flag:
+            # Drop cases with too few valid members so they aren't scored
+            results_df = _mask_low_member_frac(
+                results_df, num_members, ensemble_fraction=ensemble_fraction
+            )
+
         det_df, prob_df = _evaluate_metrics(
             ground_truth_df=ibtracs,
             prediction_df=results_df,
             deterministic_metrics=deterministic_metrics,
             probabilistic_metrics=probabilistic_metrics,
             verbose=verbose,
+            ensemble_fraction=ensemble_fraction,
         )
 
         if det_df is not None:
@@ -916,25 +967,30 @@ def evaluate_tracks(
 
 # %% Testing
 if __name__ == "__main__":
-    # Example usage
-    eval_directory = "/home/mgomezd1/repos/idea_testing/outputs_rev"
-    ibtracs_tracks_path = "/home/mgomezd1/repos/idea_testing/ibtracs"
-    year = 2023
-    recompute = True
-    basin = None
-    verbose = True
-    select_files = None
-    lead_hours = None  # Use default lead hours if None
-    # lead_hours = [6, 12, 18, 24, 48, 72, 96, 120]  # Postproc Hours
+    # Run settings from the configuration file (CONFIG_PATH)
+    with open(CONFIG_PATH) as f:
+        _config = yaml.safe_load(f)
+
+    # lead_hours: null (all), a list, or a start/stop/step range
+    _leads = _config.get("lead_hours")
+    if isinstance(_leads, dict):
+        lead_hours = list(range(_leads["start"], _leads["stop"] + 1, _leads["step"]))
+    else:
+        lead_hours = _leads
+
     evaluate_tracks(
-        eval_directory,
-        ibtracs_tracks_path,
+        _config["eval_directory"],
+        _config["ibtracs_tracks_path"],
         lead_hours=lead_hours,
-        year=year,
-        recompute=recompute,
-        basin=basin,
-        verbose=verbose,
-        select_files=select_files,
+        year=_config["year"],
+        recompute=_config.get("recompute", False),
+        basin=_config.get("basin") or None,
+        verbose=_config.get("verbose", True),
+        select_files=_config.get("select_files"),
+        ensemble_fraction=_config.get("ensemble_fraction", 0.3),
+        ri_thresh=_config.get("ri_thresh", 30),
+        ri_window=_config.get("ri_window", 24),
+        ri_ens_fraction=_config.get("ri_ens_fraction", 0.3),
     )
 
 # %%
