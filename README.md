@@ -23,7 +23,15 @@ TCBench aims to provide opportunities to study the predictability of tropical cy
 
 ## Getting Started
 
-Please refer to our getting started jupyter notebook: Getting_Started.ipynb. Special thanks to Samuel Darmon for his work on it.
+Please refer to our getting started jupyter notebook: `dev/Getting_started.ipynb`. Special thanks to Samuel Darmon for his work on it.
+
+The scripts and the notebook expect to be run from the `dev` folder (launch the Jupyter kernel there): the configuration files and the paths inside them are relative to it. The evaluation pipeline is:
+
+1. **(Optional) Match raw tracks to IBTrACS:** `python track_matcher.py --model <model> --ibtracs_path <IBTrACS csv>` writes `<model>.csv` in the evaluation schema.
+2. **Evaluate:** `python evaluate_tracks.py`, configured by `evaluate_tracks_config.yaml`. It builds the IBTrACS ground truth and the climatology and persistence baselines, and writes the per-case results of each model.
+3. **Summarize and plot:** `python plot_errors.py`, configured by `plot_errors_config.yaml`. It writes the summary tables, scorecards and figures.
+
+Model track files are named `<year>_<MODEL>.csv` (e.g. `2023_AIFS.csv`) and hold the columns `sid`, `initial_time`, `valid_time`, any of `wind_max`, `pressure_min`, `lat`, `lon`, and `ensemble_idx` for ensembles. See the notebook for details.
 
 ### Folder Structure
 ```
@@ -36,24 +44,20 @@ tcbench/
 ├── requirements.txt
 └── dev/
     ├── __init__.py
-    ├── baselines.py
-    ├── climatology_maker.py
-    ├── compute_clim_results.py
-    ├── compute_persistence.py
-    ├── data_preprocessing.py
-    ├── eval_plotter.py
+    ├── Getting_started.ipynb
+    ├── track_matcher.py
     ├── evaluate_tracks.py
-    ├── evaluate_tracks_RI.py
-    ├── Getting_Started.ipynb
+    ├── evaluate_tracks_config.yaml
     ├── metrics.py
-    ├── metrics_test.py
     ├── plot_errors.py
-    ├── plot_RI.py
+    ├── plot_errors_config.yaml
+    ├── baselines_postproc.py
+    ├── metrics_postproc.py
+    ├── postprocessing_data_preprocessing.py
     ├── postprocessing_model_dfBuilder.py
     ├── postprocessing training (deep).py
     ├── postprocessing training (linear).py
     ├── TempestExtremes_example.sh
-    ├── track_matcher.py
     └── utils/
         ├── __init__.py
         ├── constants.py
@@ -62,9 +66,14 @@ tcbench/
         └── toolbox.py
 
 ```
-`\dev` contains all of the python scripts needed to evaluate your tracks. <br>
-`\dev\utils\constants.py` holds reference values for some operations carried out by TCBench. This includes classes describing the tracks provided by, e.g., IBTrACS, which facilitate track processing.  <br>
-`\dev\utils\toolbox.py` includes support functions and classes used during evaluation.
-`\dev\utils\ML_functions.py` includes support functions/classes for the post-processing models.
-`\dev\utils\data_lib.py` includes support functions/classes for the post-processing models.
+`dev` contains all of the python scripts needed to evaluate your tracks. <br>
+`dev/track_matcher.py` matches tracks detected in model outputs (e.g. with TempestExtremes, see `TempestExtremes_example.sh`) to IBTrACS storms using HuracánPy. <br>
+`dev/evaluate_tracks.py` evaluates the model track files against IBTrACS and computes the climatology and persistence baselines; `dev/metrics.py` holds the deterministic, probabilistic and rapid intensification metrics it uses. <br>
+`dev/plot_errors.py` aggregates the evaluation results into summary tables, scorecards and figures. <br>
+`dev/evaluate_tracks_config.yaml` and `dev/plot_errors_config.yaml` hold the run settings (paths, year, basin, lead times) and, for plotting, the model display names, styles and colors. <br>
+`dev/baselines_postproc.py`, `dev/metrics_postproc.py`, `dev/postprocessing_data_preprocessing.py`, `dev/postprocessing_model_dfBuilder.py` and the `postprocessing training` scripts build, train and apply the benchmarked post-processing models. <br>
+`dev/utils/constants.py` holds reference values for some operations carried out by TCBench. This includes classes describing the tracks provided by, e.g., IBTrACS, which facilitate track processing. <br>
+`dev/utils/toolbox.py` includes support functions and classes used during evaluation, e.g. the IBTrACS reader. <br>
+`dev/utils/ML_functions.py` includes support functions/classes for the post-processing models. <br>
+`dev/utils/data_lib.py` includes support functions/classes for the post-processing models.
 
