@@ -1495,9 +1495,9 @@ def read_hist_track_file(**kwargs):
     Parameters
     ----------
     tracks_path : STR, required
-        Path to the folder holding the storm track in a single file.
-        The default is f'{repo_path}/tracks/ibtracs'. By default the file
-        is expected to be in csv format
+        Path to the storm track file, or to a folder holding it as its only
+        file. The default is f'{repo_path}/tracks/ibtracs'. By default the
+        file is expected to be in csv format
 
     backend : FUNC, required
         file handler for loading the track file. The default is pandas'
@@ -1528,11 +1528,18 @@ def read_hist_track_file(**kwargs):
     track_cols = kwargs.get("track_cols", constants.ibtracs_cols)
     skip_rows = kwargs.get("skip_rows", [1])
     lon_mode = kwargs.get("lon_mode", 360)
-    file_list = os.listdir(tracks_path)
+    if os.path.isdir(tracks_path):
+        file_list = os.listdir(tracks_path)
+        assert (
+            len(file_list) == 1
+        ), f"{tracks_path} must hold exactly one file, found {len(file_list)}. Aborting."
+        track_file = os.path.join(tracks_path, file_list[0])
+    elif os.path.isfile(tracks_path):
+        track_file = tracks_path
+    else:
+        raise FileNotFoundError(f"{tracks_path} is neither a file nor a directory.")
 
-    assert len(file_list) == 1, f"{tracks_path} has more than one file. Aborting."
-
-    with open(f"{tracks_path}/{file_list[0]}") as handle:
+    with open(track_file) as handle:
         if backend == pd.read_csv:
             data = backend(
                 handle,

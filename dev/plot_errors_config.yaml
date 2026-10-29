@@ -1,8 +1,10 @@
-# Plotting configuration for plot_errors_rev.py
+# Plotting configuration for plot_errors.py
 # Colors are any matplotlib color: hex ('#RRGGBB'), named ('black') or a
 # grayscale level as a quoted string ('0.88').
 
 # --- Run settings (used when the script is run as __main__)
+# Relative paths are resolved from the dev folder, where the kernel (or the
+# script) is expected to be launched; absolute paths also work.
 # Evaluation year: selects the results files (*_det_<year>, *_prob_<year>,
 # *_ri_<year>) and the IBTrACS ground truth, and tags the output file names
 year: 2023
@@ -11,13 +13,14 @@ year: 2023
 # storm is in that basin (IBTrACS basin at the initial time); output file names
 # are then tagged <year>_<basin>
 basin: null
-# Folder holding the IBTrACS file (ibtracs.ALL.list...csv), read to find the
-# forecasts of the basin
-ibtracs_tracks_path: "/home/mgomezd1/repos/idea_testing/ibtracs"
+# IBTrACS file (ibtracs.ALL.list...csv), or a folder holding it as its only
+# file; read to find the forecasts of the basin
+ibtracs_tracks_path: "data/ibtracs"
 # Folder with the evaluation results and the IBTrACS ground truth
-result_folder: "/home/mgomezd1/repos/idea_testing/outputs_rev"
+# (eval_directory in evaluate_tracks_config.yaml)
+result_folder: "results"
 # Folder the summary CSVs and figures are written to (created if missing)
-plotting_folder: "/home/mgomezd1/repos/idea_testing/outputs_rev/plotting_csvs"
+plotting_folder: "results/plotting_csvs"
 # Evaluated lead times in hours, from start to stop (both included) every step
 lead_hours:
   start: 6
@@ -26,30 +29,35 @@ lead_hours:
 
 # --- Models and metrics
 
-# Display name per model (raw names as in the results file names)
+# Display name per model (raw names: the track file name without .csv, as in
+# the results file names). The climatology and persistence baselines are
+# recognized by their CLIM / PERSIST prefix, after an optional '<year>_'.
 pretty_names:
-  "2023_PANGU_adj": "Pangu"
+  "2023_AIFS": "AIFS"
+  "2023_FCNET": "FCNet"
+  "2023_FNV3P2": "FNV3P2"
+  "2023_GENCAST": "GenCast"
+  "2023_PANGU": "Pangu"
+  "2023_PANGU_POSTPROC_ANN": "Postprocessed Pangu (ANN)"
+  "2023_PANGU_POSTPROC_MLR": "Postprocessed Pangu (MLR)"
+  "2023_PANGU_POSTPROC_UNET": "Postprocessed Pangu (UNet)"
   "2023_TIGGE_GEFS": "GEFS"
   "2023_TIGGE_IFS": "IFS"
-  "2023_aifs_adj": "AIFS"
-  "2023_fcnet_adj": "FCNet"
-  "2023_fnv3p2": "FNV3P2"
-  "2023_postprocessing_panguweather_ANN_LeakyReLU,_M": "Postprocessed Pangu (ANN)"
-  "2023_postprocessing_panguweather_MLR_Masked": "Postprocessed Pangu (MLR)"
-  "2023_postprocessing_panguweather_UNetv2_dout_0.33": "Postprocessed Pangu (UNet)"
-  "CLIM-intensity-y2023": "Mean Tendency (CLIM)"
-  "PERSIST-intensity-y2023": "Persistence"
-  "gencast": "GenCast"
+  "2023_HMON": "HMON"
+  "2023_HWFI": "HWFI"
+  "2023_SHIP": "SHIP"
+  "2023_CLIM-intensity": "Mean Tendency (CLIM)"
+  "2023_PERSISTENCE": "Persistence"
 
 # Line style per model (raw names) in the lead-time panels; others are solid
 model_linestyles:
   # "2023_TIGGE_GEFS": "--"
   # "2023_TIGGE_IFS": "--"
-  # "gencast": "--"
-  # "2023_fnv3p2": "--"
-  "2023_postprocessing_panguweather_ANN_LeakyReLU,_M": "--"
-  "2023_postprocessing_panguweather_MLR_Masked": "--"
-  "2023_postprocessing_panguweather_UNetv2_dout_0.33": "--"
+  # "2023_GENCAST": "--"
+  # "2023_FNV3P2": "--"
+  "2023_PANGU_POSTPROC_ANN": "--"
+  "2023_PANGU_POSTPROC_MLR": "--"
+  "2023_PANGU_POSTPROC_UNET": "--"
 
 # Hatch of the same models (those with a model_linestyles entry) in bar panels
 # (single quotes: backslashes are taken literally)
@@ -60,15 +68,15 @@ scorecard_hatch: '\\\'
 # Models (raw names) excluded from all summaries, coverage and plots, with the
 # reason for excluding them
 ignored_models:
-  "2023_postprocessing_panguweather_MLR_Masked": "only shown in RI due to crowding"
-  "2023_postprocessing_panguweather_UNetv2_dout_0.33": "only shown in RI due to crowding"
-  "SHIP": "not shown in main plots because it's basin specific"
-  "HMON": "not shown in main plots because it's basin specific"
-  "HWFI": "not shown in main plots because it's basin specific"
+  # "2023_PANGU_POSTPROC_MLR": "only shown in RI due to crowding"
+  # "2023_PANGU_POSTPROC_UNET": "only shown in RI due to crowding"
+  "2023_SHIP": "not shown in main plots because it's basin specific"
+  "2023_HMON": "not shown in main plots because it's basin specific"
+  "2023_HWFI": "not shown in main plots because it's basin specific"
   # "2023_TIGGE_IFS": "not shown in basin plots due to crowding"
-  # "2023_PANGU_adj": "not shown in basin plots due to crowding"
-  # "2023_fcnet_adj": "not shown in basin plots due to crowding"
-  # "gencast": "not shown in basin plots due to crowding"
+  # "2023_PANGU": "not shown in basin plots due to crowding"
+  # "2023_FCNET": "not shown in basin plots due to crowding"
+  # "2023_GENCAST": "not shown in basin plots due to crowding"
   
   
 

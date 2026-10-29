@@ -1,1785 +1,1182 @@
-# Climatology Baseline Models
-# Date: 2024.05.24
-# This file contains the metrics used for evaluating model performance.
-# The metrics are implemented following the scikit-learn convention.
-# Author: Milton Gomez
+# %%
+import warnings
 
-# From SKLearn:
-# Functions named as ``*_score`` return a scalar value to maximize: the higher
-# the better.
-
-# Function named as ``*_error`` or ``*_loss`` return a scalar value to minimize:
-# the lower the better.
-
-# %% Imports
-# OS and IO
-import os
-import sys
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import numpy as np
-import dask.array as da
 import pandas as pd
-from scipy.special import erf
-import torch
-
-# Backend Libraries
-import joblib as jl
-
-from utils import toolbox, constants, ML_functions as mlf
-from utils import data_lib as dlib
+import numpy as np
 
 
-# %% Reference Dictionaries
-short_names = {
-    "root_mean_squared_error": "RMSE",
-    "mean_squared_error": "MSE",
-    "mean_absolute_error": "MAE",
-    "mean_absolute_percentage_error": "MAPE",
-    "mean_squared_logarithmic_error": "MSLE",
-    "r2_score": "R2",
-    "explained_variance_score": "EV",
-    "max_error": "ME",
-    "mean_poisson_deviance": "MPD",
-    "mean_gamma_deviance": "MGD",
-    "mean_tweedie_deviance": "MTD",
-    "continuous_ranked_probability_score": "CRPS",
-}
+# %% helper functions
+def _get_refkeys(col_dict: dict, df: pd.DataFrame) -> tuple:
+    column_keys = col_dict.copy()
 
-units = {"wind": "kts", "pressure": "hPa"}
+    ref_keys = [*column_keys.values()]
+    if column_keys.get("ensemble_idx", None):
+        ref_keys.remove(column_keys.get("ensemble_idx", None))
+
+    if column_keys.get("lead_hours", None):
+        ref_keys.remove(column_keys.get("lead_hours", None))
+
+    return ref_keys
 
 
-# %% Base Class
-class metric(object):
-    """Base class for all metrics."""
+def _add_lead_hours(df: pd.DataFrame, col_keys: dict | None = None) -> pd.DataFrame:
+    """Return a copy of df with lead hours computed as valid time - initial time,
+    placed immediately to the right of the valid time column. Any existing lead
+    hours column is replaced."""
+    col_keys = col_keys or {}
+    it_col = col_keys.get("initial_time", "initial_time")
+    vt_col = col_keys.get("valid_time", "valid_time")
+    lead_col = col_keys.get("lead_hours", None) or "lead_hours"
 
-    def __init__(self, name, function, unit=None, long_name=None, return_labels=None):
-        self.name = name
-        self.unit = unit
-        self.function = function
-        self.long_name = long_name
-        self.return_labels = return_labels
+    lead = (
+        pd.to_datetime(df[vt_col]) - pd.to_datetime(df[it_col])
+    ).dt.total_seconds() / 3600
 
-    def __repr__(self):
-        return f"{self.long_name if self.long_name else ''} {self.__class__.__name__}({self.name}, {self.unit})"
-
-    def __str__(self):
-        return f"{self.name}"
-
-    def __call__(self, reference, predictions, **kwargs):
-        """Compute the metric between the reference and predictions.
-        Parameters
-        ----------
-        reference : pandas dataframe with shape (n_samples, n_features)
-            The reference values. Needs to have the SID, lat, lon columns.
-        predictions : pandas dataframe with shape (n_samples, n_features)
-            The predicted values.
-        """
-        return self.function(reference, predictions, **kwargs)
+    df = df.drop(columns=lead_col, errors="ignore")
+    df.insert(df.columns.get_loc(vt_col) + 1, lead_col, lead.to_numpy().astype(int))
+    return df
 
 
-# # %% Utilities
-# def _check_regression(y_true, y_pred):
-#     """Check that the regression inputs are of the correct form."""
-#     raise NotImplementedError
-#     assert y_true.shape == y_pred.shape, "y_true and y_pred must have the same shape."
-#     # assert y_true.ndim == 1, "y_true and y_pred must be 1D arrays."
-#     # assert y_pred.ndim == 1, "y_true and y_pred must be 1D arrays."
-#     return y_true, y_pred
+def haversine(lat1, lon1, lat2, lon2, radius=6371.0):
+    """Great-circle distance in km; inputs in degrees, broadcastable."""
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = (
+        np.sin((lat2 - lat1) / 2) ** 2
+        + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
+    )
+    return 2 * radius * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
 
 
-# def _check_classification(y_true, y_pred):
-#     """Check that the classification inputs are of the correct form."""
-#     raise NotImplementedError
-#     assert y_true.shape == y_pred.shape, "y_true and y_pred must have the same shape."
-#     # assert y_true.ndim == 1, "y_true and y_pred must be 1D arrays."
-#     # assert y_pred.ndim == 1, "y_true and y_pred must be 1D arrays."
-#     return y_true, y_pred
+def bearing(lat1, lon1, lat2, lon2):
+    """Initial great-circle bearing from point 1 to point 2, in radians clockwise
+    from north; inputs in degrees, broadcastable."""
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    dlon = lon2 - lon1
+    return np.arctan2(
+        np.sin(dlon) * np.cos(lat2),
+        np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon),
+    )
 
 
-# # %% Metrics
+def to_lon360(df: pd.DataFrame, lon_cols) -> pd.DataFrame:
+    """Return a copy of df with the given longitude columns wrapped to [0, 360).
 
-
-# # def CRPS(y_true, y_pred):
-# #     """Compute the Continuous Ranked Probability Score (CRPS).
-
-# #     The CRPS is a probabilistic metric that evaluates the accuracy of a
-# #     probabilistic forecast. It is defined as the integral of the squared
-# #     difference between the cumulative distribution function (CDF) of the
-# #     forecast and the CDF of the observations.
-
-# #     Parameters
-# #     ----------
-# #     y_true : array-like of shape (n_samples,)
-# #         The true target values.
-
-# #     y_pred : array-like of shape (n_samples, n_classes)
-# #         The predicted probabilities for each class.
-
-# #     Returns
-# #     -------
-# #     crps : float
-# #         The CRPS value.
-# #     """
-# #     # Check that the inputs are of the correct form
-# #     y_true, y_pred = _check_classification(y_true, y_pred)
-
-# #     # Compute the CRPS
-# #     raise NotImplementedError
-# #     return crps
-
-
-def CRPS_ML(y_pred, y_true, **kwargs):
-    """Compute the Continuous Ranked Probability Score (CRPS).
-
-    The CRPS is a probabilistic metric that evaluates the accuracy of a
-    probabilistic forecast. It is defined as the integral of the squared
-    difference between the cumulative distribution function (CDF) of the
-    forecast and the CDF of the observations.
-
-    Parameters
-    ----------
-
-    y_pred : array-like of shape (n_samples, 2*n_features)
-        The predicted probability parameters for each sample. The odd columns
-        should contain the mean (mu), and the even columns should contain the
-        standard deviation (sigma).
-
-    y_true : array-like of shape (n_samples,n_features)
-
-    Returns
-    -------
-    crps : float or array-like
-        The CRPS value mean, or array of individual CRPS values.
-
+    Accepts a single column name or a list of names. NaNs are preserved.
     """
-    # taken from https://github.com/WillyChap/ARML_Probabilistic/blob/main/Coastal_Points/Testing_and_Utility_Notebooks/CRPS_Verify.ipynb
-    # and work by Louis Poulain--Auzeau (https://github.com/louisPoulain)
-    reduction = kwargs.get("reduction", "mean")
-    mu = y_pred[:, ::2]
-    sigma = y_pred[:, 1::2]
+    if isinstance(lon_cols, str):
+        lon_cols = [lon_cols]
+    df = df.copy()
+    for col in lon_cols:
+        df[col] = np.mod(df[col], 360.0)
+    return df
 
-    # prevent negative sigmas
-    sigma = torch.sqrt(sigma.pow(2))
-    loc = (y_true - mu) / sigma
-    pdf = torch.exp(-0.5 * loc.pow(2)) / torch.sqrt(
-        2 * torch.from_numpy(np.array(np.pi))
-    )
-    cdf = 0.5 * (1.0 + torch.erf(loc / torch.sqrt(torch.tensor(2.0))))
 
-    # compute CRPS for each (input, truth) pair
-    crps = sigma * (
-        loc * (2.0 * cdf - 1.0)
-        + 2.0 * pdf
-        - 1.0 / torch.from_numpy(np.array(np.sqrt(np.pi)))
+def _to_xyz(lat, lon):
+    """Unit vectors (..., 3) from latitude/longitude in degrees; NaN propagates."""
+    la, lo = np.radians(lat), np.radians(lon)
+    return np.stack(
+        [np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)], axis=-1
     )
 
-    return crps.mean() if reduction == "mean" else crps
 
-
-# def CRPSLoss(y_pred, y_true, **kwargs):
-#     reduction = kwargs.get("reduction", "mean")
-#     loss = 0.0
-#     indiv_losses = np.empty((y_true.shape))
-
-#     for i in range(0, y_true.shape[1]):
-#         l = CRPS_ML(y_pred[:, i * 2 : (i + 1) * 2], y_true[:, i], reduction=reduction)
-#         loss += l
-#         indiv_losses[:, i] = l.detach().cpu().numpy()
-
-#     return loss / (y_true.shape[1] // 2), indiv_losses
-
-
-def CRPS_np(mu, sigma, y, **kwargs):
-    reduction = kwargs.get("reduction", "mean")
-    sigma = np.sqrt(sigma**2)
-    loc = (y - mu) / sigma
-    pdf = np.exp(-0.5 * loc**2) / np.sqrt(2 * np.pi)
-    cdf = 0.5 * (1.0 + erf(loc / np.sqrt(2)))
-    crps = sigma * (loc * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / np.sqrt(np.pi))
-    return crps.mean() if reduction == "mean" else crps
-
-
-# def CRPSNumpy(mu_pred, sigma_pred, y_true, **kwargs):
-#     reduction = kwargs.get("reduction", "mean")
-#     indiv_losses = np.empty((y_true.shape))
-
-#     for i in range(0, y_true.shape[1]):
-#         l = CRPS_np(mu_pred[:, i], sigma_pred[:, i], y_true[:, i], reduction=reduction)
-#         indiv_losses[:, i] = l
-
-#     return indiv_losses
-
-
-# def summarize_performance(y_true, y_pred, y_baseline, metrics: list, **kwargs):
-#     """Summarize the performance of the model and the baseline.
-
-#     Parameters
-#     ----------
-#     y_true : array-like of shape (n_samples,)
-#         The true target values.
-
-#     y_pred : array-like of shape (n_samples,)
-#         The predicted target values.
-
-#     y_baseline : array-like of shape (n_samples,)
-#         The baseline target values.
-
-#     metrics : list of functions
-#         The list of metrics to compute.
-
-#     Returns
-#     -------
-#     performance : dict
-#         A dictionary containing the performance metrics.
-#     """
-#     # # Check that the inputs are of the correct form
-#     # y_true, y_pred = _check_regression(y_true, y_pred)
-#     # y_true, y_baseline = _check_regression(y_true, y_baseline)
-
-#     # Assert that the predictions have the shape (n_samples, n_features)
-#     assert y_pred.ndim == 2, "y_pred must have shape (n_samples, n_features)"
-
-#     y_labels = kwargs.get("y_labels", {0: "Wind", 1: "Pressure"})
-
-#     # Compute the performance metrics
-#     performance = {}
-#     for metric in metrics:
-#         for i in range(y_pred.shape[1]):
-#             y_true_i = y_true[:, i]
-#             y_pred_i = y_pred[:, i]
-#             y_baseline_i = y_baseline[:, i]
-
-#             if metric.__name__ in short_names.keys():
-#                 metric_name = short_names[metric.__name__]
-#             else:
-#                 metric_name = metric.__name__
-
-#             performance[f"{metric_name}_{y_labels[i]}"] = metric(y_true_i, y_pred_i)
-#             performance[f"{metric_name}_{y_labels[i]}_baseline"] = metric(
-#                 y_true_i, y_baseline_i
-#             )
-
-#             if kwargs.get("skill", True):
-#                 performance[f"{metric_name}_{y_labels[i]}_skill"] = (
-#                     1
-#                     - performance[f"{metric_name}_{y_labels[i]}"]
-#                     / performance[f"{metric_name}_{y_labels[i]}_baseline"]
-#                 )
-
-#     return performance
-
-
-# # %%
-# def plot_performance(metrics: dict, ax, **kwargs):
-#     """Plot the performance metrics.
-
-#     Parameters
-#     ----------
-#     metrics : dict
-#         A dictionary containing the performance metrics.
-
-#     ax : matplotlib.axes.Axes
-#         The axes to plot the metrics on.
-
-#     Returns
-#     -------
-#     None
-#     """
-#     if kwargs.get("skill", True):
-#         assert isinstance(
-#             ax, np.ndarray
-#         ), "ax should be a numpy array if skill=True (default)"
-
-#         ax1 = ax[0]
-#         ax2 = ax[1]
-#     else:
-#         ax1 = ax
-
-#     model_name = kwargs.get("model_name", "Model")
-#     baseline_name = kwargs.get("baseline_name", "Baseline")
-
-#     # Generate a list of unique metrics
-#     metric_names = []
-#     for metric in metrics.keys():
-#         if not ("skill" in metric or "baseline" in metric):
-#             metric_names.append(metric)
-#     metric_names = np.unique(metric_names)
-
-#     # Define the colors for the bars
-#     colors = kwargs.get("colors", plt.cm.tab20.colors)
-
-#     ax1_labels = []
-#     # Plot the performance metrics
-#     for i, metric in enumerate(metric_names):
-#         model_metric = metrics[metric]
-#         baseline_metric = metrics[f"{metric}_baseline"]
-#         var = metric.split("_")[-1].lower()
-#         unit = units.get(var, "")
-#         ax1.bar(
-#             [i * 3],
-#             [model_metric],
-#             color=colors[i % len(colors)],
-#             label=f"{model_name} {metric} ({unit})",
-#             hatch=kwargs.get("model_hatch", None),
-#         )
-
-#         ax1.bar(
-#             [i * 3 + 1],
-#             [baseline_metric],
-#             color=colors[i % len(colors)],
-#             label=f"{baseline_name} {metric} ({unit})",
-#             hatch=kwargs.get("baseline_hatch", "//"),
-#         )
-
-#         ax1.set_ylabel("Score")
-#         ax1.set_title("Performance Metrics")
-
-#         ax1_labels += [f"{model_name} metric", f"{baseline_name} {metric}", ""]
-
-#         if kwargs.get("skill", True):
-#             ax2.bar(
-#                 [i],
-#                 [metrics[f"{metric}_skill"]],
-#                 color=colors[i % len(colors)],
-#                 label=f"{metric} Skill Score",
-#                 hatch=kwargs.get("skill_hatch", None),
-#             )
-#             ax2.set_ylabel("Skill Score (1 - model/baseline)")
-#             ax2.set_title("Skill Scores")
-
-#     ax1.set_xticks(range(len(metric_names) * 3))
-#     ax1.set_xticklabels([""] * len(ax1_labels))
-#     ax1.legend(loc="lower right", framealpha=0.5)
-
-#     if kwargs.get("skill", True):
-#         ax2.set_xticks(range(len(metric_names)))
-#         ax2.set_xticklabels([""] * len(metric_names))
-#         ax2.legend(loc="lower right", framealpha=0.5)
-
-
-def _DPE(reference, predictions, **kwargs):
-    """Compute the Direct Position Error (DPE) between the reference and predictions.
-    Parameters
-    ----------
-    reference : pandas dataframe with shape (n_samples, n_features)
-        The reference values. Needs to have the SID, lat, lon columns.
-
-    predictions : pandas dataframe with shape (n_samples, n_features)
-        The predicted values."""
-
-    # Check if a columns dictionary for the reference DataFrame is provided
-    ref_col_dict = kwargs.get("ref_columns", None)
-    if ref_col_dict is None:
-        # Default columns dictionary
-        ref_cols = {
-            "SID": "SID",
-            "lat": "LAT",
-            "lon": "LON",
-            "initial_time": "ISO_TIME",
-        }
-    else:
-        ref_cols = ref_col_dict
-
-    # Check if a columns dictionary for the predictions DataFrame is provided
-    pred_col_dict = kwargs.get("pred_columns", None)
-    if pred_col_dict is None:
-        # Default columns dictionary
-        pred_cols = {
-            "SID": "SID",
-            "lat": "lat",
-            "lon": "lon",
-            "valid_time": "Valid Time",
-            "init_time": "Initial Time",
-        }
-    else:
-        pred_cols = pred_col_dict
-
-    # Check if the reference DataFrame contains the required columns
-    for key in ref_cols.values():
-        if key not in reference.columns:
-            raise ValueError(f"Missing column '{key}' in reference DataFrame.")
-
-    # Check that the predictions DataFrame contains the required columns
-    for key in pred_cols.values():
-        if key not in predictions.columns:
-            raise ValueError(f"Missing column '{key}' in predictions DataFrame.")
-
-    def storm_processor(ref, preds, storm_id):
-        # Get the reference and prediction data for the current storm ID
-        ref_data = ref[reference[ref_cols["SID"]] == storm_id].copy()
-        pred_data = preds[predictions[pred_cols["SID"]] == storm_id].copy()
-
-        # check if the predictions are probabilistic by searching the columns
-        # for the word "ensemble"
-        probabilistic = False
-        ensemble_dim = None
-        for col in pred_data.columns:
-            if "ensemble" in col:
-                probabilistic = True
-                ensemble_dim = col
-                break
-
-        if not probabilistic:
-            ## TODO - why did this even happen with Pangu/FCnet?
-            # if initial time and valid time combination is repeated in prediction,
-            # remove the duplicates
-            pred_data = pred_data.drop_duplicates(
-                subset=[pred_cols["valid_time"], pred_cols["init_time"]], keep="first"
-            )
-
-        # make the initial time and valid time columns datetime
-        pred_data[pred_cols["valid_time"]] = pd.to_datetime(
-            pred_data[pred_cols["valid_time"]]
-        )
-        pred_data[pred_cols["init_time"]] = pd.to_datetime(
-            pred_data[pred_cols["init_time"]]
-        )
-
-        # if pred_data is empty, return empty dataframe with additional dpe column
-        if pred_data.empty:
-            pred_data["DPE"] = np.nan
-            return pred_data
-
-        for initial_time in pred_data[pred_cols["init_time"]].unique():
-
-            pred_data_vals = pred_data[
-                pd.to_datetime(pred_data[pred_cols["init_time"]]) == initial_time
-            ].copy()
-            # convert the init and valid time  to datetime
-            pred_data_vals[pred_cols["valid_time"]] = pd.to_datetime(
-                pred_data_vals[pred_cols["valid_time"]]
-            )
-            pred_data_vals[pred_cols["init_time"]] = pd.to_datetime(
-                pred_data_vals[pred_cols["init_time"]]
-            )
-
-            if not probabilistic:
-                try:
-                    val_times = pd.to_datetime(
-                        pred_data_vals[pred_cols["valid_time"]]
-                    ).to_numpy()
-                    ref_times = ref_data[ref_cols["initial_time"]].to_numpy()
-                    bool_mask = np.isin(ref_times, val_times)
-                    ref_times = ref_times[bool_mask]
-
-                    pred_data_vals.loc[:, "ref_lat"] = np.nan
-                    pred_data_vals.loc[:, "ref_lon"] = np.nan
-
-                    locator = np.isin(
-                        pd.to_datetime(
-                            pred_data_vals[pred_cols["valid_time"]]
-                        ).to_numpy(),
-                        ref_times,
-                    )
-
-                    pred_data_vals.loc[locator, "ref_lat"] = ref_data[
-                        ref_cols["lat"]
-                    ].to_numpy()[bool_mask]
-                    pred_data_vals.loc[locator, "ref_lon"] = ref_data[
-                        ref_cols["lon"]
-                    ].to_numpy()[bool_mask]
-                    dist = toolbox.haversine(
-                        pred_data_vals["ref_lat"].to_numpy(),
-                        pred_data_vals["ref_lon"].to_numpy(),
-                        pred_data_vals[pred_cols["lat"]].to_numpy(),
-                        pred_data_vals[pred_cols["lon"]].to_numpy(),
-                    )
-                    pred_data_locator = (
-                        (pred_data[pred_cols["SID"]] == storm_id)
-                        & np.isin(
-                            pred_data[pred_cols["valid_time"]],
-                            pred_data_vals[pred_cols["valid_time"]],
-                        )
-                        & (pred_data[pred_cols["init_time"]] == initial_time)
-                    )
-                    pred_data.loc[pred_data_locator, "DPE"] = dist
-                except Exception as e:
-                    print(
-                        f"Error processing storm {storm_id} at initial time {initial_time}: {e}"
-                    )
-                    continue
-            else:
-                for member in pred_data_vals[ensemble_dim].unique():
-                    pred_data_vals_ens = pred_data_vals[
-                        pred_data_vals[ensemble_dim] == member
-                    ].copy()
-                    val_times = pd.to_datetime(
-                        pred_data_vals_ens[pred_cols["valid_time"]]
-                    ).to_numpy()
-                    ref_times = ref_data[ref_cols["initial_time"]].to_numpy()
-                    bool_mask = np.isin(ref_times, val_times)
-                    ref_times = ref_times[bool_mask]
-
-                    pred_data_vals_ens.loc[:, "ref_lat"] = np.nan
-                    pred_data_vals_ens.loc[:, "ref_lon"] = np.nan
-
-                    locator = np.isin(
-                        pd.to_datetime(
-                            pred_data_vals_ens[pred_cols["valid_time"]]
-                        ).to_numpy(),
-                        ref_times,
-                    )
-
-                    pred_data_vals_ens.loc[locator, "ref_lat"] = ref_data[
-                        ref_cols["lat"]
-                    ].to_numpy()[bool_mask]
-                    pred_data_vals_ens.loc[locator, "ref_lon"] = ref_data[
-                        ref_cols["lon"]
-                    ].to_numpy()[bool_mask]
-
-                    dist = toolbox.haversine(
-                        pred_data_vals_ens["ref_lat"].to_numpy(),
-                        pred_data_vals_ens["ref_lon"].to_numpy(),
-                        pred_data_vals_ens[pred_cols["lat"]].to_numpy(),
-                        pred_data_vals_ens[pred_cols["lon"]].to_numpy(),
-                    )
-
-                    pred_data_locator = (
-                        (pred_data[pred_cols["SID"]] == storm_id)
-                        & np.isin(
-                            pred_data[pred_cols["valid_time"]],
-                            pred_data_vals_ens[pred_cols["valid_time"]],
-                        )
-                        & (pred_data[ensemble_dim] == member)
-                        & (pred_data[pred_cols["init_time"]] == initial_time)
-                    )
-                    pred_data.loc[pred_data_locator, "DPE"] = dist
-
-        return pred_data
-
-        # temp_df_locator = (temp_df["SID"] == storm_id) & np.isin(temp_df["Valid Time"], pred_data_vals_ens[pred_cols["valid_time"]]) & (temp_df["Initial Time"] == initial_time) & (temp_df[ensemble_dim] == member)
-
-        # temp_df.loc[temp_df_locator, "DPE"] = dist
-
-    # process the storms with joblib parallel
-    results = jl.Parallel(n_jobs=6)(
-        jl.delayed(storm_processor)(reference, predictions, storm_id)
-        for storm_id in reference.SID.unique()
+def _to_latlon(v):
+    """Latitude/longitude in degrees of (..., 3) vectors; zero vectors give NaN."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        norm = np.linalg.norm(v, axis=-1)
+        lat = np.degrees(np.arcsin(np.clip(v[..., 2] / norm, -1.0, 1.0)))
+    lon = np.degrees(np.arctan2(v[..., 1], v[..., 0]))
+    return lat, np.where(np.isnan(lat), np.nan, lon)
+
+
+# %% Deterministic Metrics
+def AbsErr(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Absolute Error (AbsErr) metric.
+    Args:
+        reference_df (pd.DataFrame): DataFrame containing the reference values.
+        forecast_df (pd.DataFrame): DataFrame containing the forecast values.
+        **kwargs: Additional keyword arguments
+
+        Additional arguments:
+        column_keys (dict): Dictionary mapping columns containing the initial time,
+        valid time, and storm ID.
+
+
+        target_cols (list): List with the target columns to be evaluated.
+        Default is ['wind_max', 'pressure_min']
+
+    Returns:
+        pd.DataFrame: DataFrame containing the computed metric values.
+    """
+
+    ref_keys = _get_refkeys(
+        kwargs.get(
+            "column_keys",
+            {
+                "storm_id": "sid",
+                "initial_time": "initial_time",
+                "valid_time": "valid_time",
+                "ensemble_idx": "ensemble_idx",
+                "lead_hours": "lead_hours",
+            },
+        ),
+        forecast_df,
     )
 
-    # Combine the results into a single DataFrame
-    temp_df = pd.concat(results, ignore_index=True)
+    target_cols = kwargs.get("target_cols", ["wind_max", "pressure_min"])
 
-    # for val_time in pred_data[pred_cols["valid_time"]].unique():
-    #     # Get the reference and prediction data for the current valid time
-    #     ref_data_val = ref_data[ref_data[ref_cols["initial_time"]] == val_time]
-    #     pred_data_val = pred_data[pred_data[pred_cols["valid_time"]] == val_time]
-
-    #     # if the reference or prediction values are empty strings, set them to NaN
-    #     ref_data_val.loc[:, ref_cols["lat"]] = ref_data_val[
-    #         ref_cols["lat"]
-    #     ].replace(" ", np.nan)
-    #     ref_data_val.loc[:, ref_cols["lon"]] = ref_data_val[
-    #         ref_cols["lon"]
-    #     ].replace(" ", np.nan)
-    #     pred_data_val.loc[:, pred_cols["lat"]] = pred_data_val[
-    #         pred_cols["lat"]
-    #     ].replace(" ", np.nan)
-    #     pred_data_val.loc[:, pred_cols["lon"]] = pred_data_val[
-    #         pred_cols["lon"]
-    #     ].replace(" ", np.nan)
-
-    #     if len(ref_data_val) == 0 or len(pred_data_val) == 0:
-    #         continue
-
-    #     # skip if all values are NaN
-    #     if (
-    #         ref_data_val[ref_cols["lat"]].isna().all()
-    #         or pred_data_val[pred_cols["lat"]].isna().all()
-    #     ):
-    #         continue
-
-    # distances = toolbox.haversine(
-    #     ref_data_val[ref_cols["lat"]].to_numpy(),
-    #     ref_data_val[ref_cols["lon"]].to_numpy(),
-    #     pred_data_val[pred_cols["lat"]].to_numpy(),
-    #     pred_data_val[pred_cols["lon"]].to_numpy(),
-    # )
-
-    # locator = (temp_df["SID"] == storm_id) & (temp_df["Valid Time"] == val_time)
-    # temp_df.loc[locator, "DPE"] = distances
-
-    #     pred_data.loc[pred_data_val.index, "DPE"] = distances
-
-    # # if all pred_data["DPE"] are NaN, continue
-    # if pred_data["DPE"].isna().all():
-    #     continue
-
-    # locator = (temp_df["SID"] == storm_id) & (temp_df["Valid Time"] == val_time)
-    return temp_df["DPE"].to_numpy()
-
-
-def _SE(reference, predictions, **kwargs):
-    """Compute the Squared Error (SE) between the reference and predictions
-    for the wind and minimum pressure.
-
-    Parameters
-    ----------
-    reference : pandas dataframe with shape (n_samples, n_features)
-        The reference values. Needs to have the SID, lat, lon columns.
-
-    predictions : pandas dataframe with shape (n_samples, n_features)
-        The predicted values."""
-    # Check if a columns dictionary for the reference DataFrame is provided
-    ref_col_dict = kwargs.get("ref_columns", None)
-    if ref_col_dict is None:
-        # Default columns dictionary
-        ref_cols = {
-            "SID": "SID",
-            "wind": "USA_WIND",
-            "pressure": "USA_PRES",
-            "initial_time": "ISO_TIME",
-        }
-    else:
-        ref_cols = ref_col_dict
-
-    # Check if a columns dictionary for the predictions DataFrame is provided
-    pred_col_dict = kwargs.get("pred_columns", None)
-    if pred_col_dict is None:
-        # Default columns dictionary
-        pred_cols = {
-            "SID": "SID",
-            "wind": "wind max",
-            "pressure": "pressure min",
-            "valid_time": "Valid Time",
-            "init_time": "Initial Time",
-        }
-    else:
-        pred_cols = pred_col_dict
-
-    # Check if the reference DataFrame contains the required columns
-    for key in ref_cols.values():
-        if key not in reference.columns:
-            raise ValueError(f"Missing column '{key}' in reference DataFrame.")
-
-    # Check that the predictions DataFrame contains the required columns
-    for key in pred_cols.values():
-        if key not in predictions.columns:
-            raise ValueError(f"Missing column '{key}' in predictions DataFrame.")
-
-    def storm_processor(ref, preds, storm_id):
-        # Get the reference and prediction data for the current storm ID
-        ref_data = ref[reference[ref_cols["SID"]] == storm_id].copy()
-        pred_data = preds[predictions[pred_cols["SID"]] == storm_id].copy()
-
-        # convert the wind and pressure columns to numeric
-        ref_data[ref_cols["wind"]] = pd.to_numeric(
-            ref_data[ref_cols["wind"]], errors="coerce"
-        )
-        ref_data[ref_cols["pressure"]] = pd.to_numeric(
-            ref_data[ref_cols["pressure"]], errors="coerce"
-        )
-        pred_data[pred_cols["wind"]] = pd.to_numeric(
-            pred_data[pred_cols["wind"]], errors="coerce"
-        )
-        pred_data[pred_cols["pressure"]] = pd.to_numeric(
-            pred_data[pred_cols["pressure"]], errors="coerce"
-        )
-
-        # check if the predictions are probabilistic by searching the columns
-        # for the word "ensemble"
-        probabilistic = False
-        ensemble_dim = None
-        for col in pred_data.columns:
-            if "ensemble" in col:
-                probabilistic = True
-                ensemble_dim = col
-                break
-
-        if not probabilistic:
-            ## TODO - why did this even happen with Pangu/FCnet?
-            # if initial time and valid time combination is repeated in prediction,
-            # remove the duplicates
-            pred_data = pred_data.drop_duplicates(
-                subset=[pred_cols["valid_time"], pred_cols["init_time"]], keep="first"
-            )
-
-        # make the initial time and valid time columns datetime
-        pred_data[pred_cols["valid_time"]] = pd.to_datetime(
-            pred_data[pred_cols["valid_time"]]
-        )
-        pred_data[pred_cols["init_time"]] = pd.to_datetime(
-            pred_data[pred_cols["init_time"]]
-        )
-
-        # if pred_data is empty, return empty dataframe with additional dpe column
-        pred_data["SE_wind"] = np.nan
-        pred_data["SE_pressure"] = np.nan
-        if pred_data.empty:
-            return pred_data
-
-        for initial_time in pred_data[pred_cols["init_time"]].unique():
-
-            pred_data_vals = pred_data[
-                pd.to_datetime(pred_data[pred_cols["init_time"]]) == initial_time
-            ].copy()
-            # convert the init and valid time  to datetime
-            pred_data_vals[pred_cols["valid_time"]] = pd.to_datetime(
-                pred_data_vals[pred_cols["valid_time"]]
-            )
-            pred_data_vals[pred_cols["init_time"]] = pd.to_datetime(
-                pred_data_vals[pred_cols["init_time"]]
-            )
-
-            if not probabilistic:
-                try:
-                    val_times = pd.to_datetime(
-                        pred_data_vals[pred_cols["valid_time"]]
-                    ).to_numpy()
-                    ref_times = ref_data[ref_cols["initial_time"]].to_numpy()
-                    bool_mask = np.isin(ref_times, val_times)
-                    ref_times = ref_times[bool_mask]
-
-                    pred_data_vals.loc[:, "ref_wind"] = np.nan
-                    pred_data_vals.loc[:, "ref_pres"] = np.nan
-
-                    locator = np.isin(
-                        pd.to_datetime(
-                            pred_data_vals[pred_cols["valid_time"]]
-                        ).to_numpy(),
-                        ref_times,
-                    )
-                    pred_data_vals.loc[locator, "ref_wind"] = ref_data[
-                        ref_cols["wind"]
-                    ].to_numpy()[bool_mask]
-                    pred_data_vals.loc[locator, "ref_pres"] = ref_data[
-                        ref_cols["pressure"]
-                    ].to_numpy()[bool_mask]
-                    # if the reference or prediction values are empty strings, set them to NaN
-                    pred_data_vals.loc[:, pred_cols["wind"]] = pred_data_vals[
-                        pred_cols["wind"]
-                    ].replace(" ", np.nan)
-                    pred_data_vals.loc[:, pred_cols["pressure"]] = pred_data_vals[
-                        pred_cols["pressure"]
-                    ].replace(" ", np.nan)
-                    pred_data_vals.loc[:, "ref_wind"] = pred_data_vals[
-                        "ref_wind"
-                    ].replace(" ", np.nan)
-                    pred_data_vals.loc[:, "ref_pres"] = pred_data_vals[
-                        "ref_pres"
-                    ].replace(" ", np.nan)
-                    pred_data_locator = (
-                        (pred_data[pred_cols["SID"]] == storm_id)
-                        & np.isin(
-                            pred_data[pred_cols["valid_time"]],
-                            pred_data_vals[pred_cols["valid_time"]],
-                        )
-                        & (pred_data[pred_cols["init_time"]] == initial_time)
-                    )
-                    pred_data.loc[pred_data_locator, "SE_wind"] = np.nan
-                    pred_data.loc[pred_data_locator, "SE_pressure"] = np.nan
-                    # skip if all wind and pressure values are NaN
-                    if (
-                        pred_data_vals[pred_cols["wind"]].isna().all()
-                        or pred_data_vals[pred_cols["pressure"]].isna().all()
-                    ):
-                        continue
-                    se_wind = (
-                        pred_data_vals[pred_cols["wind"]].to_numpy().astype(float)
-                        - pred_data_vals["ref_wind"].to_numpy().astype(float)
-                    ) ** 2
-                    se_pressure = (
-                        pred_data_vals[pred_cols["pressure"]].to_numpy().astype(float)
-                        - pred_data_vals["ref_pres"].to_numpy().astype(float)
-                    ) ** 2
-                    pred_data.loc[pred_data_locator, "SE_wind"] = se_wind
-                    pred_data.loc[pred_data_locator, "SE_pressure"] = se_pressure
-                #     pred_data_vals.loc[:,"ref_lat"] = np.nan
-                #     pred_data_vals.loc[:,"ref_lon"] = np.nan
-
-                #     locator = np.isin(pd.to_datetime(pred_data_vals[pred_cols["valid_time"]]).to_numpy(), ref_times)
-
-                #     pred_data_vals.loc[locator, "ref_lat"] = ref_data[ref_cols["lat"]].to_numpy()[bool_mask]
-                #     pred_data_vals.loc[locator, "ref_lon"] = ref_data[ref_cols["lon"]].to_numpy()[bool_mask]
-                #     dist = toolbox.haversine(
-                #         pred_data_vals["ref_lat"].to_numpy(),
-                #         pred_data_vals["ref_lon"].to_numpy(),
-                #         pred_data_vals[pred_cols["lat"]].to_numpy(),
-                #         pred_data_vals[pred_cols["lon"]].to_numpy(),
-                #     )
-                #     pred_data_locator = (pred_data[pred_cols["SID"]] == storm_id) & np.isin(pred_data[pred_cols["valid_time"]], pred_data_vals[pred_cols["valid_time"]]) & (pred_data[pred_cols["init_time"]] == initial_time)
-                #     pred_data.loc[pred_data_locator, "DPE"] = dist
-                except Exception as e:
-                    print(
-                        f"Error processing storm {storm_id} at initial time {initial_time}: {e}"
-                    )
-                    continue
-            else:
-                for member in pred_data_vals[ensemble_dim].unique():
-                    pred_data_vals_ens = pred_data_vals[
-                        pred_data_vals[ensemble_dim] == member
-                    ].copy()
-                    val_times = pd.to_datetime(
-                        pred_data_vals_ens[pred_cols["valid_time"]]
-                    ).to_numpy()
-                    ref_times = ref_data[ref_cols["initial_time"]].to_numpy()
-                    bool_mask = np.isin(ref_times, val_times)
-                    ref_times = ref_times[bool_mask]
-
-                    pred_data_vals_ens.loc[:, "ref_wind"] = np.nan
-                    pred_data_vals_ens.loc[:, "ref_pres"] = np.nan
-
-                    locator = np.isin(
-                        pd.to_datetime(
-                            pred_data_vals_ens[pred_cols["valid_time"]]
-                        ).to_numpy(),
-                        ref_times,
-                    )
-
-                    pred_data_vals_ens.loc[locator, "ref_wind"] = ref_data[
-                        ref_cols["wind"]
-                    ].to_numpy()[bool_mask]
-                    pred_data_vals_ens.loc[locator, "ref_pres"] = ref_data[
-                        ref_cols["pressure"]
-                    ].to_numpy()[bool_mask]
-
-                    # if the reference or prediction values are empty strings, set them to NaN
-                    pred_data_vals_ens.loc[:, pred_cols["wind"]] = pred_data_vals_ens[
-                        pred_cols["wind"]
-                    ].replace(" ", np.nan)
-                    pred_data_vals_ens.loc[:, pred_cols["pressure"]] = (
-                        pred_data_vals_ens[pred_cols["pressure"]].replace(" ", np.nan)
-                    )
-                    pred_data_vals_ens.loc[:, "ref_wind"] = pred_data_vals_ens[
-                        "ref_wind"
-                    ].replace(" ", np.nan)
-                    pred_data_vals_ens.loc[:, "ref_pres"] = pred_data_vals_ens[
-                        "ref_pres"
-                    ].replace(" ", np.nan)
-
-                    pred_data_locator = (
-                        (pred_data[pred_cols["SID"]] == storm_id)
-                        & np.isin(
-                            pred_data[pred_cols["valid_time"]],
-                            pred_data_vals_ens[pred_cols["valid_time"]],
-                        )
-                        & (pred_data[ensemble_dim] == member)
-                        & (pred_data[pred_cols["init_time"]] == initial_time)
-                    )
-                    pred_data.loc[pred_data_locator, "SE_wind"] = np.nan
-                    pred_data.loc[pred_data_locator, "SE_pressure"] = np.nan
-
-                    # skip if all wind and pressure values are NaN
-                    if (
-                        pred_data_vals_ens[pred_cols["wind"]].isna().all()
-                        or pred_data_vals_ens[pred_cols["pressure"]].isna().all()
-                    ):
-                        continue
-
-                    se_wind = (
-                        pred_data_vals_ens[pred_cols["wind"]].to_numpy().astype(float)
-                        - pred_data_vals_ens["ref_wind"].to_numpy().astype(float)
-                    ) ** 2
-                    se_pressure = (
-                        pred_data_vals_ens[pred_cols["pressure"]]
-                        .to_numpy()
-                        .astype(float)
-                        - pred_data_vals_ens["ref_pres"].to_numpy().astype(float)
-                    ) ** 2
-
-                    pred_data.loc[pred_data_locator, "SE_wind"] = se_wind
-                    pred_data.loc[pred_data_locator, "SE_pressure"] = se_pressure
-
-        return pred_data
-
-    # process the storms with joblib parallel
-    results = jl.Parallel(n_jobs=6)(
-        jl.delayed(storm_processor)(reference, predictions, storm_id)
-        for storm_id in reference.SID.unique()
+    eval_df = forecast_df.merge(
+        reference_df[[*ref_keys, *target_cols]],
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
+        validate="many_to_one",
     )
 
-    # Combine the results into a single DataFrame
-    temp_df = pd.concat(results, ignore_index=True)
-
-    return temp_df[["SE_wind", "SE_pressure"]].to_numpy()
-
-    # temp_df = predictions.copy()
-    # temp_df["SE_wind"] = np.nan
-    # temp_df["SE_pressure"] = np.nan
-    # for storm_id in reference.SID.unique():
-    #     # Get the reference and prediction data for the current storm ID
-    #     ref_data = reference[reference[ref_cols["SID"]] == storm_id].copy()
-    #     pred_data = predictions[predictions[pred_cols["SID"]] == storm_id]
-
-    #     for val_time in pred_data[pred_cols["valid_time"]].unique():
-    #         # Get the reference and prediction data for the current valid time
-    #         ref_data_val = ref_data[ref_data[ref_cols["initial_time"]] == val_time]
-    #         pred_data_val = pred_data[pred_data[pred_cols["valid_time"]] == val_time]
-
-    #         # if the reference or prediction values are empty strings, set them to NaN
-    #         ref_data_val.loc[:, ref_cols["wind"]] = ref_data_val[
-    #             ref_cols["wind"]
-    #         ].replace(" ", np.nan)
-    #         ref_data_val.loc[:, ref_cols["pressure"]] = ref_data_val[
-    #             ref_cols["pressure"]
-    #         ].replace(" ", np.nan)
-    #         pred_data_val.loc[:, pred_cols["wind"]] = pred_data_val[
-    #             pred_cols["wind"]
-    #         ].replace(" ", np.nan)
-    #         pred_data_val.loc[:, pred_cols["pressure"]] = pred_data_val[
-    #             pred_cols["pressure"]
-    #         ].replace(" ", np.nan)
-
-    #         if len(ref_data_val) == 0 or len(pred_data_val) == 0:
-    #             continue
-    #         # skip if all values are NaN
-    #         if (
-    #             ref_data_val[ref_cols["wind"]].isna().all()
-    #             or pred_data_val[pred_cols["wind"]].isna().all()
-    #         ):
-    #             continue
-
-    #         se_wind = (
-    #             ref_data_val[ref_cols["wind"]].to_numpy().astype(float)
-    #             - pred_data_val[pred_cols["wind"]].to_numpy().astype(float)
-    #         ) ** 2
-    #         se_pressure = (
-    #             ref_data_val[ref_cols["pressure"]].to_numpy().astype(float)
-    #             - pred_data_val[pred_cols["pressure"]].to_numpy().astype(float)
-    #         ) ** 2
-    #         temp_df.loc[pred_data_val.index, "SE_wind"] = np.sqrt(se_wind)
-    #         temp_df.loc[pred_data_val.index, "SE_pressure"] = np.sqrt(se_pressure)
-
-    # return temp_df[["SE_wind", "SE_pressure"]]
-
-
-def _AE(reference, predictions, **kwargs):
-    """Compute the Absolute Error (MAE) between the reference and predictions
-    for the wind and minimum pressure.
-
-    Parameters
-    ----------
-    reference : pandas dataframe with shape (n_samples, n_features)
-        The reference values. Needs to have the SID, lat, lon columns.
-
-    predictions : pandas dataframe with shape (n_samples, n_features)
-        The predicted values."""
-    # Check if a columns dictionary for the reference DataFrame is provided
-    ref_col_dict = kwargs.get("ref_columns", None)
-    if ref_col_dict is None:
-        # Default columns dictionary
-        ref_cols = {
-            "SID": "SID",
-            "wind": "USA_WIND",
-            "pressure": "USA_PRES",
-            "initial_time": "ISO_TIME",
-        }
-    else:
-        ref_cols = ref_col_dict
-
-    # Check if a columns dictionary for the predictions DataFrame is provided
-    pred_col_dict = kwargs.get("pred_columns", None)
-    if pred_col_dict is None:
-        # Default columns dictionary
-        pred_cols = {
-            "SID": "SID",
-            "wind": "wind max",
-            "pressure": "pressure min",
-            "valid_time": "Valid Time",
-            "init_time": "Initial Time",
-        }
-    else:
-        pred_cols = pred_col_dict
-
-    # Check if the reference DataFrame contains the required columns
-    for key in ref_cols.values():
-        if key not in reference.columns:
-            raise ValueError(f"Missing column '{key}' in reference DataFrame.")
-
-    # Check that the predictions DataFrame contains the required columns
-    for key in pred_cols.values():
-        if key not in predictions.columns:
-            raise ValueError(f"Missing column '{key}' in predictions DataFrame.")
-
-    def storm_processor(ref, preds, storm_id):
-        # Get the reference and prediction data for the current storm ID
-        ref_data = ref[reference[ref_cols["SID"]] == storm_id].copy()
-        pred_data = preds[predictions[pred_cols["SID"]] == storm_id].copy()
-
-        # convert the wind and pressure columns to numeric
-        ref_data[ref_cols["wind"]] = pd.to_numeric(
-            ref_data[ref_cols["wind"]], errors="coerce"
-        )
-        ref_data[ref_cols["pressure"]] = pd.to_numeric(
-            ref_data[ref_cols["pressure"]], errors="coerce"
-        )
-        pred_data[pred_cols["wind"]] = pd.to_numeric(
-            pred_data[pred_cols["wind"]], errors="coerce"
-        )
-        pred_data[pred_cols["pressure"]] = pd.to_numeric(
-            pred_data[pred_cols["pressure"]], errors="coerce"
+    decimals = kwargs.get("decimals", 2)
+    for col in target_cols:
+        eval_df[f"AbsErr_{col}"] = (
+            (eval_df[f"{col}_ref"] - eval_df[f"{col}_fcst"]).abs().round(decimals)
         )
 
-        # check if the predictions are probabilistic by searching the columns
-        # for the word "ensemble"
-        probabilistic = False
-        ensemble_dim = None
-        for col in pred_data.columns:
-            if "ensemble" in col:
-                probabilistic = True
-                ensemble_dim = col
-                break
+    # drop the reference column, rename the forecast column to the original name, and return only the relevant columns
+    eval_df = eval_df.drop(columns=[f"{col}_ref" for col in target_cols])
+    eval_df = eval_df.rename(columns={f"{col}_fcst": col for col in target_cols})
 
-        if not probabilistic:
-            ## TODO - why did this even happen with Pangu/FCnet?
-            # if initial time and valid time combination is repeated in prediction,
-            # remove the duplicates
-            pred_data = pred_data.drop_duplicates(
-                subset=[pred_cols["valid_time"], pred_cols["init_time"]], keep="first"
-            )
+    return _add_lead_hours(eval_df, kwargs.get("column_keys"))
 
-        # make the initial time and valid time columns datetime
-        pred_data[pred_cols["valid_time"]] = pd.to_datetime(
-            pred_data[pred_cols["valid_time"]]
-        )
-        pred_data[pred_cols["init_time"]] = pd.to_datetime(
-            pred_data[pred_cols["init_time"]]
-        )
 
-        # if pred_data is empty, return empty dataframe with additional dpe column
-        pred_data["AE_wind"] = np.nan
-        pred_data["AE_pressure"] = np.nan
+def SquErr(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Squared Error (SquErr) metric.
+    Args:
+        reference_df (pd.DataFrame): DataFrame containing the reference values.
+        forecast_df (pd.DataFrame): DataFrame containing the forecast values.
+        **kwargs: Additional keyword arguments
 
-        if pred_data.empty:
-            return pred_data
+        Additional arguments:
+        column_keys (dict): Dictionary mapping columns containing the initial time,
+        valid time, and storm ID.
 
-        for initial_time in pred_data[pred_cols["init_time"]].unique():
+        target_cols (list): List with the target columns to be evaluated.
+        Default is ['wind_max', 'pressure_min']
 
-            pred_data_vals = pred_data[
-                pd.to_datetime(pred_data[pred_cols["init_time"]]) == initial_time
-            ].copy()
-            # convert the init and valid time  to datetime
-            pred_data_vals[pred_cols["valid_time"]] = pd.to_datetime(
-                pred_data_vals[pred_cols["valid_time"]]
-            )
-            pred_data_vals[pred_cols["init_time"]] = pd.to_datetime(
-                pred_data_vals[pred_cols["init_time"]]
-            )
+    Returns:
+        pd.DataFrame: DataFrame containing the computed metric values.
+    """
 
-            if not probabilistic:
-                try:
-                    val_times = pd.to_datetime(
-                        pred_data_vals[pred_cols["valid_time"]]
-                    ).to_numpy()
-                    ref_times = ref_data[ref_cols["initial_time"]].to_numpy()
-                    bool_mask = np.isin(ref_times, val_times)
-                    ref_times = ref_times[bool_mask]
-
-                    pred_data_vals.loc[:, "ref_wind"] = np.nan
-                    pred_data_vals.loc[:, "ref_pres"] = np.nan
-
-                    locator = np.isin(
-                        pd.to_datetime(
-                            pred_data_vals[pred_cols["valid_time"]]
-                        ).to_numpy(),
-                        ref_times,
-                    )
-                    pred_data_vals.loc[locator, "ref_wind"] = ref_data[
-                        ref_cols["wind"]
-                    ].to_numpy()[bool_mask]
-                    pred_data_vals.loc[locator, "ref_pres"] = ref_data[
-                        ref_cols["pressure"]
-                    ].to_numpy()[bool_mask]
-                    # if the reference or prediction values are empty strings, set them to NaN
-                    pred_data_vals.loc[:, pred_cols["wind"]] = pred_data_vals[
-                        pred_cols["wind"]
-                    ].replace(" ", np.nan)
-                    pred_data_vals.loc[:, pred_cols["pressure"]] = pred_data_vals[
-                        pred_cols["pressure"]
-                    ].replace(" ", np.nan)
-                    pred_data_vals.loc[:, "ref_wind"] = pred_data_vals[
-                        "ref_wind"
-                    ].replace(" ", np.nan)
-                    pred_data_vals.loc[:, "ref_pres"] = pred_data_vals[
-                        "ref_pres"
-                    ].replace(" ", np.nan)
-                    pred_data_locator = (
-                        (pred_data[pred_cols["SID"]] == storm_id)
-                        & np.isin(
-                            pred_data[pred_cols["valid_time"]],
-                            pred_data_vals[pred_cols["valid_time"]],
-                        )
-                        & (pred_data[pred_cols["init_time"]] == initial_time)
-                    )
-                    pred_data.loc[pred_data_locator, "AE_wind"] = np.nan
-                    pred_data.loc[pred_data_locator, "AE_pressure"] = np.nan
-                    # skip if all wind and pressure values are NaN
-                    if (
-                        pred_data_vals[pred_cols["wind"]].isna().all()
-                        or pred_data_vals[pred_cols["pressure"]].isna().all()
-                    ):
-                        continue
-                    ae_wind = np.abs(
-                        pred_data_vals[pred_cols["wind"]].to_numpy().astype(float)
-                        - pred_data_vals["ref_wind"].to_numpy().astype(float)
-                    )
-                    ae_pressure = np.abs(
-                        pred_data_vals[pred_cols["pressure"]].to_numpy().astype(float)
-                        - pred_data_vals["ref_pres"].to_numpy().astype(float)
-                    )
-                    pred_data.loc[pred_data_locator, "AE_wind"] = ae_wind
-                    pred_data.loc[pred_data_locator, "AE_pressure"] = ae_pressure
-                #     pred_data_vals.loc[:,"ref_lat"] = np.nan
-                #     pred_data_vals.loc[:,"ref_lon"] = np.nan
-
-                #     locator = np.isin(pd.to_datetime(pred_data_vals[pred_cols["valid_time"]]).to_numpy(), ref_times)
-
-                #     pred_data_vals.loc[locator, "ref_lat"] = ref_data[ref_cols["lat"]].to_numpy()[bool_mask]
-                #     pred_data_vals.loc[locator, "ref_lon"] = ref_data[ref_cols["lon"]].to_numpy()[bool_mask]
-                #     dist = toolbox.haversine(
-                #         pred_data_vals["ref_lat"].to_numpy(),
-                #         pred_data_vals["ref_lon"].to_numpy(),
-                #         pred_data_vals[pred_cols["lat"]].to_numpy(),
-                #         pred_data_vals[pred_cols["lon"]].to_numpy(),
-                #     )
-                #     pred_data_locator = (pred_data[pred_cols["SID"]] == storm_id) & np.isin(pred_data[pred_cols["valid_time"]], pred_data_vals[pred_cols["valid_time"]]) & (pred_data[pred_cols["init_time"]] == initial_time)
-                #     pred_data.loc[pred_data_locator, "DPE"] = dist
-                except Exception as e:
-                    print(
-                        f"Error processing storm {storm_id} at initial time {initial_time}: {e}"
-                    )
-                    continue
-            else:
-                for member in pred_data_vals[ensemble_dim].unique():
-                    pred_data_vals_ens = pred_data_vals[
-                        pred_data_vals[ensemble_dim] == member
-                    ].copy()
-                    val_times = pd.to_datetime(
-                        pred_data_vals_ens[pred_cols["valid_time"]]
-                    ).to_numpy()
-                    ref_times = ref_data[ref_cols["initial_time"]].to_numpy()
-                    bool_mask = np.isin(ref_times, val_times)
-                    ref_times = ref_times[bool_mask]
-
-                    pred_data_vals_ens.loc[:, "ref_wind"] = np.nan
-                    pred_data_vals_ens.loc[:, "ref_pres"] = np.nan
-
-                    locator = np.isin(
-                        pd.to_datetime(
-                            pred_data_vals_ens[pred_cols["valid_time"]]
-                        ).to_numpy(),
-                        ref_times,
-                    )
-
-                    pred_data_vals_ens.loc[locator, "ref_wind"] = ref_data[
-                        ref_cols["wind"]
-                    ].to_numpy()[bool_mask]
-                    pred_data_vals_ens.loc[locator, "ref_pres"] = ref_data[
-                        ref_cols["pressure"]
-                    ].to_numpy()[bool_mask]
-
-                    # if the reference or prediction values are empty strings, set them to NaN
-                    pred_data_vals_ens.loc[:, pred_cols["wind"]] = pred_data_vals_ens[
-                        pred_cols["wind"]
-                    ].replace(" ", np.nan)
-                    pred_data_vals_ens.loc[:, pred_cols["pressure"]] = (
-                        pred_data_vals_ens[pred_cols["pressure"]].replace(" ", np.nan)
-                    )
-                    pred_data_vals_ens.loc[:, "ref_wind"] = pred_data_vals_ens[
-                        "ref_wind"
-                    ].replace(" ", np.nan)
-                    pred_data_vals_ens.loc[:, "ref_pres"] = pred_data_vals_ens[
-                        "ref_pres"
-                    ].replace(" ", np.nan)
-
-                    pred_data_locator = (
-                        (pred_data[pred_cols["SID"]] == storm_id)
-                        & np.isin(
-                            pred_data[pred_cols["valid_time"]],
-                            pred_data_vals_ens[pred_cols["valid_time"]],
-                        )
-                        & (pred_data[ensemble_dim] == member)
-                        & (pred_data[pred_cols["init_time"]] == initial_time)
-                    )
-                    pred_data.loc[pred_data_locator, "AE_wind"] = np.nan
-                    pred_data.loc[pred_data_locator, "AE_pressure"] = np.nan
-
-                    # skip if all wind and pressure values are NaN
-                    if (
-                        pred_data_vals_ens[pred_cols["wind"]].isna().all()
-                        or pred_data_vals_ens[pred_cols["pressure"]].isna().all()
-                    ):
-                        continue
-
-                    ae_wind = np.abs(
-                        pred_data_vals_ens[pred_cols["wind"]].to_numpy().astype(float)
-                        - pred_data_vals_ens["ref_wind"].to_numpy().astype(float)
-                    )
-                    ae_pressure = np.abs(
-                        pred_data_vals_ens[pred_cols["pressure"]]
-                        .to_numpy()
-                        .astype(float)
-                        - pred_data_vals_ens["ref_pres"].to_numpy().astype(float)
-                    )
-
-                    pred_data.loc[pred_data_locator, "AE_wind"] = ae_wind
-                    pred_data.loc[pred_data_locator, "AE_pressure"] = ae_pressure
-
-        return pred_data
-
-    # process the storms with joblib parallel
-    results = jl.Parallel(n_jobs=6)(
-        jl.delayed(storm_processor)(reference, predictions, storm_id)
-        for storm_id in reference.SID.unique()
+    ref_keys = _get_refkeys(
+        kwargs.get(
+            "column_keys",
+            {
+                "storm_id": "sid",
+                "initial_time": "initial_time",
+                "valid_time": "valid_time",
+                "ensemble_idx": "ensemble_idx",
+                "lead_hours": "lead_hours",
+            },
+        ),
+        forecast_df,
     )
 
-    # Combine the results into a single DataFrame
-    temp_df = pd.concat(results, ignore_index=True)
+    target_cols = kwargs.get("target_cols", ["wind_max", "pressure_min"])
 
-    return temp_df[["AE_wind", "AE_pressure"]].to_numpy()
-
-    # temp_df = predictions.copy()
-    # temp_df["AE_wind"] = np.nan
-    # temp_df["AE_pressure"] = np.nan
-    # for storm_id in reference.SID.unique():
-    #     # Get the reference and prediction data for the current storm ID
-    #     ref_data = reference[reference[ref_cols["SID"]] == storm_id]
-    #     pred_data = predictions[predictions[pred_cols["SID"]] == storm_id]
-
-    #     for val_time in pred_data[pred_cols["valid_time"]].unique():
-    #         # Get the reference and prediction data for the current valid time
-    #         ref_data_val = ref_data[ref_data[ref_cols["initial_time"]] == val_time]
-    #         pred_data_val = pred_data[pred_data[pred_cols["valid_time"]] == val_time]
-
-    #         # if the reference or prediction values are empty strings, set them to NaN
-    #         ref_data_val.loc[:, ref_cols["wind"]] = ref_data_val[
-    #             ref_cols["wind"]
-    #         ].replace(" ", np.nan)
-    #         ref_data_val.loc[:, ref_cols["pressure"]] = ref_data_val[
-    #             ref_cols["pressure"]
-    #         ].replace(" ", np.nan)
-    #         pred_data_val.loc[:, pred_cols["wind"]] = pred_data_val[
-    #             pred_cols["wind"]
-    #         ].replace(" ", np.nan)
-    #         pred_data_val.loc[:, pred_cols["pressure"]] = pred_data_val[
-    #             pred_cols["pressure"]
-    #         ].replace(" ", np.nan)
-
-    #         if len(ref_data_val) == 0 or len(pred_data_val) == 0:
-    #             continue
-    #         # skip if all values are NaN
-    #         if (
-    #             ref_data_val[ref_cols["wind"]].isna().all()
-    #             or pred_data_val[pred_cols["wind"]].isna().all()
-    #         ):
-    #             continue
-
-    #         # if the reference or prediction values are empty strings, set them to NaN
-    #         ref_data_val[ref_cols["wind"]] = ref_data_val[ref_cols["wind"]].replace(
-    #             "", np.nan
-    #         )
-    #         ref_data_val[ref_cols["pressure"]] = ref_data_val[
-    #             ref_cols["pressure"]
-    #         ].replace("", np.nan)
-    #         pred_data_val[pred_cols["wind"]] = pred_data_val[pred_cols["wind"]].replace(
-    #             "", np.nan
-    #         )
-    #         pred_data_val[pred_cols["pressure"]] = pred_data_val[
-    #             pred_cols["pressure"]
-    #         ].replace("", np.nan)
-
-    #         ae_wind = ref_data_val[ref_cols["wind"]].to_numpy().astype(
-    #             float
-    #         ) - pred_data_val[pred_cols["wind"]].to_numpy().astype(float)
-    #         ae_pressure = ref_data_val[ref_cols["pressure"]].to_numpy().astype(
-    #             float
-    #         ) - pred_data_val[pred_cols["pressure"]].to_numpy().astype(float)
-    #         temp_df.loc[pred_data_val.index, "AE_wind"] = np.abs(ae_wind)
-    #         temp_df.loc[pred_data_val.index, "AE_pressure"] = np.abs(ae_pressure)
-
-    # return temp_df[["AE_wind", "AE_pressure"]]
-
-
-def _CARTE(reference, predictions, **kwargs):
-    """Compute the Cartesian Cross-Track / Along-Track / Direct Positional error
-    between the reference and predictions projected onto a cartesian plane.
-
-    Parameters
-    ----------
-    reference : pandas dataframe with shape (n_samples, n_features)
-        The reference values. Needs to have the SID, lat, lon columns.
-
-    predictions : pandas dataframe with shape (n_samples, n_features)
-        The predicted values."""
-
-    # Check if a columns dictionary for the reference DataFrame is provided
-    ref_col_dict = kwargs.get("ref_columns", None)
-    if ref_col_dict is None:
-        # Default columns dictionary
-        ref_cols = {
-            "SID": "SID",
-            "lat": "LAT",
-            "lon": "LON",
-            "initial_time": "ISO_TIME",
-        }
-    else:
-        ref_cols = ref_col_dict
-
-    # Check if a columns dictionary for the predictions DataFrame is provided
-    pred_col_dict = kwargs.get("pred_columns", None)
-    if pred_col_dict is None:
-        # Default columns dictionary
-        pred_cols = {
-            "SID": "SID",
-            "lat": "lat",
-            "lon": "lon",
-            "valid_time": "Valid Time",
-        }
-    else:
-        pred_cols = pred_col_dict
-
-    # Check if the reference DataFrame contains the required columns
-    for key in ref_cols.values():
-        if key not in reference.columns:
-            raise ValueError(f"Missing column '{key}' in reference DataFrame.")
-
-    # Check that the predictions DataFrame contains the required columns
-    for key in pred_cols.values():
-        if key not in predictions.columns:
-            raise ValueError(f"Missing column '{key}' in predictions DataFrame.")
-
-    # convert lat and lon to cartesian coordinates from scratch
-    ref_x, ref_y = toolbox.latlon_2_cartesian(
-        reference[ref_cols["lat"]].to_numpy(),
-        reference[ref_cols["lon"]].to_numpy(),
-    )
-    pred_x, pred_y = toolbox.latlon_2_cartesian(
-        predictions[pred_cols["lat"]].to_numpy(),
-        predictions[pred_cols["lon"]].to_numpy(),
+    eval_df = forecast_df.merge(
+        reference_df[[*ref_keys, *target_cols]],
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
     )
 
-    # add to respective dataframes
-    reference["x"] = ref_x
-    reference["y"] = ref_y
-    predictions["x"] = pred_x
-    predictions["y"] = pred_y
+    decimals = kwargs.get("decimals", 2)
+    for col in target_cols:
+        eval_df[f"SquErr_{col}"] = (
+            (eval_df[f"{col}_fcst"] - eval_df[f"{col}_ref"]).pow(2)
+        ).round(decimals)
 
-    temp_df = predictions.copy()
-    temp_df["ATE"] = np.nan
-    temp_df["CTE"] = np.nan
-    for storm_id in reference.SID.unique():
-        # Get the reference and prediction data for the current storm ID
-        ref_data = reference[reference[ref_cols["SID"]] == storm_id]
-        pred_data = predictions[predictions[pred_cols["SID"]] == storm_id]
+    # drop the reference column, rename the forecast column to the original name, and return only the relevant columns
+    eval_df = eval_df.drop(columns=[f"{col}_ref" for col in target_cols])
+    eval_df = eval_df.rename(columns={f"{col}_fcst": col for col in target_cols})
 
-        for val_time in pred_data[pred_cols["valid_time"]].unique():
-            # Get the reference data for the valid time and one time step before
-            ref_start = ref_data[
-                ref_data[ref_cols["initial_time"]]
-                == pd.to_datetime(val_time) - pd.Timedelta(hours=6)
-            ]
-            ref_end = ref_data[
-                ref_data[ref_cols["initial_time"]] == pd.to_datetime(val_time)
-            ]
-            pred_data_val = pred_data[pred_data[pred_cols["valid_time"]] == val_time]
-            if len(ref_start) == 0 or len(ref_end) == 0 or len(pred_data_val) == 0:
-                continue
-
-            dx_ = ref_end["x"].to_numpy() - ref_start["x"].to_numpy()
-            dy_ = ref_end["y"].to_numpy() - ref_start["y"].to_numpy()
-            norm = dx_**2 + dy_**2
-
-            if norm == 0:
-                projx = ref_start["x"].to_numpy()
-                projy = ref_start["y"].to_numpy()
-            else:
-                t = (
-                    (pred_data_val["x"].to_numpy() - ref_start["x"].to_numpy()) * dx_
-                    + (pred_data_val["y"].to_numpy() - ref_start["y"].to_numpy()) * dy_
-                ) / norm
-                projx = ref_start["x"].to_numpy() + t * dx_
-                projy = ref_start["y"].to_numpy() + t * dy_
-
-            # calculate the cross track error
-            dx = np.sqrt(
-                (pred_data_val["x"].to_numpy() - projx) ** 2
-                + (pred_data_val["y"].to_numpy() - projy) ** 2
-            )
-            dt = np.sqrt(
-                (ref_end["x"].to_numpy() - projx) ** 2
-                + (ref_end["y"].to_numpy() - projy) ** 2
-            )
-
-            # if the shape of dt and dx are not the same, then we need to
-            # tile dt
-            if dt.shape != dx.shape:
-                dt = np.tile(dt, (dx.shape[0],))
-
-            CDPE = np.sqrt(dx**2 + dt**2)
-
-            pred_data.loc[pred_data_val.index, "ATE"] = dt
-            pred_data.loc[pred_data_val.index, "CTE"] = dx
-            pred_data.loc[pred_data_val.index, "CDPE"] = CDPE
-
-        temp_df.loc[pred_data.index, "ATE"] = pred_data["ATE"]
-        temp_df.loc[pred_data.index, "CTE"] = pred_data["CTE"]
-        temp_df.loc[pred_data.index, "CDPE"] = pred_data["CDPE"]
-
-    return temp_df["ATE", "CTE", "CDPE"].to_numpy()
+    return _add_lead_hours(eval_df, kwargs.get("column_keys"))
 
 
-def _FCRPS(reference, predictions, **kwargs):
-    """Compute the Fair CRPS between the reference and predictions using the kernel
-    representation of the CRPS. Wind max and pressure min are assumed targets.
+def FairCRPS(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Fair CRPS (Leutbecher, 2019) for ensemble forecasts.
 
-    Reference:
-    Leutbecher, M. (2019). Ensemble size: How suboptimal is less than infinity?,
-    QJ Roy. Meteor. Soc., 145, 107–128.
+    CRPS_fair = mean_i |x_i - y| - sum_{i,j} |x_i - x_j| / (2 M (M - 1))
 
+    The pairwise term is computed from sorted members in O(M log M):
+    sum_{i,j} |x_i - x_j| = 2 * sum_k (2k - M - 1) x_(k).
 
-    Parameters
-    ----------
-    reference : pandas dataframe with shape (n_samples, n_features)
-        The reference values. Needs to have the SID and columns with the variables
-        to evaluate - default is `USA_WIND` and `USA_PRES`.
+    Args:
+        reference_df (pd.DataFrame): DataFrame containing the reference values.
+        forecast_df (pd.DataFrame): DataFrame containing the ensemble forecast values.
+        **kwargs: Additional keyword arguments
 
-    predictions : pandas dataframe with shape (n_samples, n_features)
-        The predicted values."""
+        Additional arguments:
+        column_keys (dict): Dictionary mapping columns containing the initial time,
+        valid time, storm ID, and ensemble index.
 
-    # Check if a columns dictionary for the reference DataFrame is provided
-    ref_col_dict = kwargs.get("ref_columns", None)
+        target_cols (list): List with the target columns to be evaluated.
+        Default is ['wind_max', 'pressure_min']
 
-    if ref_col_dict is None:
-        # Default columns dictionary
-        ref_cols = {
-            "SID": "SID",
-            "wind": "USA_WIND",
-            "pressure": "USA_PRES",
-            "initial_time": "ISO_TIME",
-        }
-    else:
-        ref_cols = ref_col_dict
-
-    # Check if a columns dictionary for the predictions DataFrame is provided
-    pred_col_dict = kwargs.get("pred_columns", None)
-    if pred_col_dict is None:
-        # Default columns dictionary
-        pred_cols = {
-            "SID": "SID",
-            "wind": "wind max",
-            "pressure": "pressure min",
-            "valid_time": "Valid Time",
-            "init_time": "Initial Time",
+    Returns:
+        pd.DataFrame: One row per forecast case, with the storm ID, initial time and
+        valid time columns followed by a FairCRPS_<col> column per target. NaN where
+        fewer than 2 members or no reference value.
+    """
+    col_keys = kwargs.get(
+        "column_keys",
+        {
+            "storm_id": "sid",
+            "initial_time": "initial_time",
+            "valid_time": "valid_time",
             "ensemble_idx": "ensemble_idx",
-        }
-    else:
-        pred_cols = pred_col_dict
-
-    # Check if the reference DataFrame contains the required columns
-    for key in ref_cols.values():
-        if key not in reference.columns:
-            raise ValueError(f"Missing column '{key}' in reference DataFrame.")
-
-    # Check that the predictions DataFrame contains the required columns
-    for key in pred_cols.values():
-        if key not in predictions.columns:
-            raise ValueError(f"Missing column '{key}' in predictions DataFrame.")
-
-    # convert the wind and pressure columns to numeric
-    reference.loc[:, ref_cols["wind"]] = pd.to_numeric(
-        reference[ref_cols["wind"]], errors="coerce"
+        },
     )
-    reference.loc[:, ref_cols["pressure"]] = pd.to_numeric(
-        reference[ref_cols["pressure"]], errors="coerce"
-    )
-    predictions.loc[:, pred_cols["wind"]] = pd.to_numeric(
-        predictions[pred_cols["wind"]], errors="coerce"
-    )
-    predictions.loc[:, pred_cols["pressure"]] = pd.to_numeric(
-        predictions[pred_cols["pressure"]], errors="coerce"
+    ref_keys = _get_refkeys(col_keys, forecast_df)
+    ens_col = col_keys.get("ensemble_idx", None)
+    if ens_col is None or ens_col not in forecast_df.columns:
+        raise ValueError(
+            "FairCRPS requires an ensemble index column. Please provide it in column_keys."
+        )
+
+    target_cols = kwargs.get("target_cols", ["wind_max", "pressure_min"])
+
+    eval_df = forecast_df[[*ref_keys, ens_col, *target_cols]].merge(
+        reference_df[[*ref_keys, *target_cols]].drop_duplicates(subset=ref_keys),
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
     )
 
-    sample_idx = predictions[pred_cols["ensemble_idx"]].unique()[0]
-    CRPS = predictions[predictions[pred_cols["ensemble_idx"]] == sample_idx].copy()
-    # keep only the SID, valid time, and init time columns
-    CRPS = CRPS[[pred_cols["SID"], pred_cols["valid_time"], pred_cols["init_time"]]]
-    # add the target columns
-    CRPS["CRPS_vmax"] = np.nan
-    CRPS["CRPS_pmin"] = np.nan
+    decimals = kwargs.get("decimals", 2)
+    result_df = eval_df[ref_keys].drop_duplicates().reset_index(drop=True)
+    for col in target_cols:
+        df = (
+            eval_df[ref_keys]
+            .assign(x=eval_df[f"{col}_fcst"], y=eval_df[f"{col}_ref"])
+            .dropna(subset=["x"])
+            .sort_values([*ref_keys, "x"])
+        )
+        grp = df.groupby(ref_keys, sort=False)
+        m = grp["x"].transform("size")
+        rank = grp.cumcount() + 1
+        df["abs_err"] = (df["x"] - df["y"]).abs()
+        df["spread"] = (2 * rank - m - 1) * df["x"]
 
-    for storm_id in reference.SID.unique():
-        # Get the reference and prediction data for the current storm ID
-        ref_data = reference[reference[ref_cols["SID"]] == storm_id]
-        pred_data = predictions[predictions[pred_cols["SID"]] == storm_id]
+        agg = df.groupby(ref_keys).agg(
+            abs_err=("abs_err", "mean"),
+            spread=("spread", "sum"),
+            m=("x", "size"),
+            y=("y", "first"),
+        )
+        crps = agg["abs_err"] - agg["spread"] / (agg["m"] * (agg["m"] - 1))
+        crps[(agg["m"] < 2) | agg["y"].isna()] = np.nan
 
-        for val_time in pred_data[pred_cols["valid_time"]].unique():
-            # Get the reference and prediction data for the current valid time
-            ref_data_val = ref_data[ref_data[ref_cols["initial_time"]] == val_time]
-            pred_data_val = pred_data[pred_data[pred_cols["valid_time"]] == val_time]
+        result_df = result_df.merge(
+            crps.round(decimals).rename(f"FairCRPS_{col}").reset_index(),
+            on=ref_keys,
+            how="left",
+        )
 
-            # if the reference or prediction values are empty strings, set them to NaN
-            ref_data_val.loc[:, ref_cols["wind"]] = ref_data_val[
-                ref_cols["wind"]
-            ].replace(" ", np.nan)
-            ref_data_val.loc[:, ref_cols["pressure"]] = ref_data_val[
-                ref_cols["pressure"]
-            ].replace(" ", np.nan)
-            pred_data_val.loc[:, pred_cols["wind"]] = pred_data_val[
-                pred_cols["wind"]
-            ].replace(" ", np.nan)
-            pred_data_val.loc[:, pred_cols["pressure"]] = pred_data_val[
-                pred_cols["pressure"]
-            ].replace(" ", np.nan)
-
-            if len(ref_data_val) == 0 or len(pred_data_val) == 0:
-                continue
-            # skip if all values are NaN
-            if (
-                ref_data_val[ref_cols["wind"]].isna().all()
-                or pred_data_val[pred_cols["wind"]].isna().all()
-            ):
-                continue
-
-            for init_time in pred_data_val[pred_cols["init_time"]].unique():
-                ensemble_vals = pred_data_val[
-                    pred_data_val[pred_cols["init_time"]] == init_time
-                ]
-                num_members = len(ensemble_vals)
-                if len(ensemble_vals) == 0:
-                    continue
-
-                ref_wind = ref_data_val[ref_cols["wind"]].to_numpy().astype(np.float32)
-                ref_pressure = (
-                    ref_data_val[ref_cols["pressure"]].to_numpy().astype(np.float32)
-                )
-
-                diff_wind = np.abs(
-                    ref_wind - ensemble_vals[pred_cols["wind"]].to_numpy()
-                )
-                diff_matrix_wind = np.abs(
-                    ensemble_vals[pred_cols["wind"]].to_numpy()[:, None]
-                    - ensemble_vals[pred_cols["wind"]].to_numpy()[None, :]
-                )
-
-                diff_pressure = np.abs(
-                    ref_pressure - ensemble_vals[pred_cols["pressure"]].to_numpy()
-                )
-                diff_matrix_pressure = np.abs(
-                    ensemble_vals[pred_cols["pressure"]].to_numpy()[:, None]
-                    - ensemble_vals[pred_cols["pressure"]].to_numpy()[None, :]
-                )
-
-                # CRPS for wind
-                crps_wind = (
-                    diff_wind.mean()
-                    - 1 / (2 * num_members * (num_members - 1)) * diff_matrix_wind.sum()
-                )
-                # CRPS for pressure
-                crps_pressure = (
-                    diff_pressure.mean()
-                    - 1
-                    / (2 * num_members * (num_members - 1))
-                    * diff_matrix_pressure.sum()
-                )
-
-                locator = (
-                    (CRPS[pred_cols["SID"]] == storm_id)
-                    & (CRPS[pred_cols["valid_time"]] == val_time)
-                    & (CRPS[pred_cols["init_time"]] == init_time)
-                )
-
-                CRPS.loc[
-                    locator,
-                    "CRPS_vmax",
-                ] = crps_wind
-                CRPS.loc[
-                    locator,
-                    "CRPS_pmin",
-                ] = crps_pressure
-
-    return CRPS[["CRPS_vmax", "CRPS_pmin"]].to_numpy()
+    return _add_lead_hours(result_df, col_keys)
 
 
-def _HCRPS(reference, predictions, **kwargs):
-    """Compute the Haversinial, Fair CRPS between the reference and predictions using the
-    kernel representation of the CRPS. lat and lon are required in the predictions.
-    Haversinial distance is used instead of the Euclidean distance to calculate the CRPS.
+def DirPosErr(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Direct Position Error (DirPosErr) metric: great-circle (haversine) distance
+    between the forecast and reference positions, in km.
+    Args:
+        reference_df (pd.DataFrame): DataFrame containing the reference values.
+        forecast_df (pd.DataFrame): DataFrame containing the forecast values.
+        **kwargs: Additional keyword arguments
 
-    Reference:
-    Leutbecher, M. (2019). Ensemble size: How suboptimal is less than infinity?,
-    QJ Roy. Meteor. Soc., 145, 107–128.
+        Additional arguments:
+        column_keys (dict): Dictionary mapping columns containing the initial time,
+        valid time, and storm ID.
 
-    Gneiting, T., & Raftery, A. E. (2007). Strictly proper scoring rules, prediction,
-    and estimation. Journal of the American statistical Association, 102(477), 359-378.
+        position_cols (tuple): Latitude and longitude columns. Default ('lat', 'lon').
 
-    Parameters
-    ----------
-    reference : pandas dataframe with shape (n_samples, n_features)
-        The reference values. Needs to have the SID and columns with the variables
-        to evaluate - default is `LAT` and `LON`.
+        radius (float): Earth radius in km. Default 6371.
 
-    predictions : pandas dataframe with shape (n_samples, n_features)
-        The predicted values."""
+    Returns:
+        pd.DataFrame: The forecast DataFrame with a DirPosErr column, in km.
+    """
+    radius = kwargs.get("radius", 6371.0)  # km
+    ref_keys = _get_refkeys(
+        kwargs.get(
+            "column_keys",
+            {
+                "storm_id": "sid",
+                "initial_time": "initial_time",
+                "valid_time": "valid_time",
+                "ensemble_idx": "ensemble_idx",
+                "lead_hours": "lead_hours",
+            },
+        ),
+        forecast_df,
+    )
 
-    # Check if a columns dictionary for the reference DataFrame is provided
-    ref_col_dict = kwargs.get("ref_columns", None)
+    lat_col, lon_col = kwargs.get("position_cols", ("lat", "lon"))
+    decimals = kwargs.get("decimals", 2)
 
-    if ref_col_dict is None:
-        # Default columns dictionary
-        ref_cols = {
-            "SID": "SID",
-            "lat": "LAT",
-            "lon": "LON",
-            "initial_time": "ISO_TIME",
-        }
-    else:
-        ref_cols = ref_col_dict
+    eval_df = forecast_df.merge(
+        reference_df[[*ref_keys, lat_col, lon_col]].drop_duplicates(subset=ref_keys),
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
+    )
 
-    # Check if a columns dictionary for the predictions DataFrame is provided
-    pred_col_dict = kwargs.get("pred_columns", None)
-    if pred_col_dict is None:
-        # Default columns dictionary
-        pred_cols = {
-            "SID": "SID",
-            "lat": "lat",
-            "lon": "lon",
-            "valid_time": "Valid Time",
-            "init_time": "Initial Time",
+    eval_df["DirPosErr"] = np.round(
+        haversine(
+            eval_df[f"{lat_col}_ref"].to_numpy(dtype=float),
+            eval_df[f"{lon_col}_ref"].to_numpy(dtype=float),
+            eval_df[f"{lat_col}_fcst"].to_numpy(dtype=float),
+            eval_df[f"{lon_col}_fcst"].to_numpy(dtype=float),
+            radius=radius,
+        ),
+        decimals,
+    )
+
+    # drop the reference columns, restore the forecast column names
+    eval_df = eval_df.drop(columns=[f"{lat_col}_ref", f"{lon_col}_ref"])
+    eval_df = eval_df.rename(
+        columns={f"{lat_col}_fcst": lat_col, f"{lon_col}_fcst": lon_col}
+    )
+
+    return _add_lead_hours(eval_df, kwargs.get("column_keys"))
+
+
+def CartPosErr(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Along-track / cross-track position error (CARTE successor).
+
+    The forecast position is projected onto a local azimuthal-equidistant plane
+    centred on the reference position E at valid time, with the y-axis along the
+    reference storm motion (from the reference position S at valid time -
+    motion_hours to E). The forecast offset is decomposed into:
+      - along-track: positive ahead of the storm (too fast), negative behind
+      - cross-track: positive right of the motion, negative left
+
+    The projection preserves distance from E, so along^2 + cross^2 equals the
+    squared haversine direct position error. Longitudes need no wrapping.
+
+    Args:
+        reference_df (pd.DataFrame): DataFrame containing the reference values.
+        forecast_df (pd.DataFrame): DataFrame containing the forecast values.
+        **kwargs: Additional keyword arguments
+
+        Additional arguments:
+        column_keys (dict): Dictionary mapping columns containing the initial time,
+        valid time, and storm ID.
+
+        position_cols (tuple): Latitude and longitude columns. Default ('lat', 'lon').
+
+        track_df (pd.DataFrame): Reference track used to find S, with the storm ID,
+        valid time and position columns. Default is reference_df.
+
+        motion_hours (float): Lookback defining the storm motion. Default 6.
+
+        min_motion_km (float): Cases where the storm moved less than this over
+        motion_hours have an undefined heading and are NaN. Default 1 km.
+
+    Returns:
+        pd.DataFrame: The forecast DataFrame with CartPosErr_along and
+        CartPosErr_cross columns, in km.
+    """
+    radius = kwargs.get("radius", 6371.0)  # km
+    col_keys = kwargs.get(
+        "column_keys",
+        {
+            "storm_id": "sid",
+            "initial_time": "initial_time",
+            "valid_time": "valid_time",
             "ensemble_idx": "ensemble_idx",
-        }
+            "lead_hours": "lead_hours",
+        },
+    )
+    ref_keys = _get_refkeys(col_keys, forecast_df)
+    sid_col, vt_col = col_keys["storm_id"], col_keys["valid_time"]
+
+    lat_col, lon_col = kwargs.get("position_cols", ("lat", "lon"))
+    track_df = kwargs.get("track_df", reference_df)
+    motion_hours = kwargs.get("motion_hours", 6)
+    min_motion_km = kwargs.get("min_motion_km", 1.0)
+    decimals = kwargs.get("decimals", 2)
+
+    eval_df = forecast_df.merge(
+        reference_df[[*ref_keys, lat_col, lon_col]].drop_duplicates(subset=ref_keys),
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
+    )
+
+    # Reference position motion_hours before valid time, looked up per storm
+    prev = (
+        track_df[[sid_col, vt_col, lat_col, lon_col]]
+        .dropna()
+        .drop_duplicates(subset=[sid_col, vt_col])
+        .rename(columns={vt_col: "_t_prev", lat_col: "_lat_prev", lon_col: "_lon_prev"})
+    )
+    eval_df["_t_prev"] = eval_df[vt_col] - pd.Timedelta(hours=motion_hours)
+    eval_df = eval_df.merge(prev, on=[sid_col, "_t_prev"], how="left")
+
+    lat_p = eval_df[f"{lat_col}_fcst"].to_numpy(dtype=float)
+    lon_p = eval_df[f"{lon_col}_fcst"].to_numpy(dtype=float)
+    lat_e = eval_df[f"{lat_col}_ref"].to_numpy(dtype=float)
+    lon_e = eval_df[f"{lon_col}_ref"].to_numpy(dtype=float)
+    lat_s = eval_df["_lat_prev"].to_numpy(dtype=float)
+    lon_s = eval_df["_lon_prev"].to_numpy(dtype=float)
+
+    # Heading of the reference motion at E (back-bearing to S, reversed)
+    heading = bearing(lat_e, lon_e, lat_s, lon_s) + np.pi
+    rel = bearing(lat_e, lon_e, lat_p, lon_p) - heading
+    dist = haversine(lat_e, lon_e, lat_p, lon_p, radius=radius)
+    motion = haversine(lat_s, lon_s, lat_e, lon_e, radius=radius)
+
+    along = dist * np.cos(rel)
+    cross = dist * np.sin(rel)
+    undefined = ~(motion >= min_motion_km)  # also catches missing S or E
+    along[undefined] = np.nan
+    cross[undefined] = np.nan
+
+    eval_df["AlongTrack"] = np.round(along, decimals)
+    eval_df["CrossTrack"] = np.round(cross, decimals)
+
+    # drop the reference and helper columns, restore the forecast column names
+    eval_df = eval_df.drop(
+        columns=[
+            f"{lat_col}_ref",
+            f"{lon_col}_ref",
+            "_t_prev",
+            "_lat_prev",
+            "_lon_prev",
+        ]
+    )
+    eval_df = eval_df.rename(
+        columns={f"{lat_col}_fcst": lat_col, f"{lon_col}_fcst": lon_col}
+    )
+
+    return _add_lead_hours(eval_df, kwargs.get("column_keys"))
+
+
+def TrackCRPS(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Track CRPS - CRPS with haversine distance (hd) in lieu of Euclidean
+    distance. Based on the FairCRPS formulation.
+
+    TCRPS = mean_i hd(x_i, y) - 1 / (2 M (M - 1)) * sum_{i!=j} hd(x_i, x_j)
+
+    Additional arguments:
+    min_member_frac (float): Minimum fraction of ensemble members with a valid
+    position required to score a case; cases below it are NaN. The denominator
+    is the number of unique ensemble indices in forecast_df. Default 30%.
+    """
+    radius = kwargs.get("radius", 6371.0)  # km
+    col_keys = kwargs.get(
+        "column_keys",
+        {
+            "storm_id": "sid",
+            "initial_time": "initial_time",
+            "valid_time": "valid_time",
+            "ensemble_idx": "ensemble_idx",
+        },
+    )
+    ref_keys = _get_refkeys(col_keys, forecast_df)
+    ens_col = col_keys.get("ensemble_idx", None)
+    if ens_col is None or ens_col not in forecast_df.columns:
+        raise ValueError(
+            "TrackCRPS requires an ensemble index column. Please provide it in column_keys."
+        )
+
+    lat_col, lon_col = kwargs.get("position_cols", ("lat", "lon"))
+    decimals = kwargs.get("decimals", 2)
+    chunk_size = kwargs.get("chunk_size", 2000)
+    min_member_frac = kwargs.get("ensemble_fraction", 0.3)
+    ensemble_size = forecast_df[ens_col].nunique()
+
+    eval_df = forecast_df[[*ref_keys, ens_col, lat_col, lon_col]].merge(
+        reference_df[[*ref_keys, lat_col, lon_col]].drop_duplicates(subset=ref_keys),
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
+    )
+    df = eval_df.dropna(subset=[f"{lat_col}_fcst", f"{lon_col}_fcst"])
+
+    grp = df.groupby(ref_keys, sort=False)
+    case = grp.ngroup().to_numpy()
+    slot = grp.cumcount().to_numpy()
+    n_cases, M = case.max() + 1, slot.max() + 1
+
+    # Padded (case, member) arrays; NaN marks absent/missing members
+    lat = np.full((n_cases, M), np.nan)
+    lon = np.full((n_cases, M), np.nan)
+    lat[case, slot] = df[f"{lat_col}_fcst"].to_numpy()
+    lon[case, slot] = df[f"{lon_col}_fcst"].to_numpy()
+
+    keys = grp.size().reset_index()[ref_keys]
+    y_lat = grp[f"{lat_col}_ref"].first().to_numpy()
+    y_lon = grp[f"{lon_col}_ref"].first().to_numpy()
+
+    m = np.sum(~np.isnan(lat), axis=1)
+    member_frac = m / ensemble_size
+    abs_err = np.nanmean(
+        haversine(lat, lon, y_lat[:, None], y_lon[:, None], radius=radius), axis=1
+    )
+
+    pair_sum = np.empty(n_cases)
+    for s in range(0, n_cases, chunk_size):
+        la, lo = lat[s : s + chunk_size], lon[s : s + chunk_size]
+        d = haversine(
+            la[:, :, None],
+            lo[:, :, None],
+            la[:, None, :],
+            lo[:, None, :],
+            radius=radius,
+        )
+        pair_sum[s : s + chunk_size] = np.nansum(
+            d, axis=(1, 2)
+        )  # ordered pairs, diag = 0
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        score = abs_err - pair_sum / (2 * m * (m - 1))
+    score[
+        (m < 2) | (member_frac < min_member_frac) | np.isnan(y_lat) | np.isnan(y_lon)
+    ] = np.nan
+
+    keys["TrackCRPS"] = np.round(score, decimals)
+    keys["member_frac"] = np.round(member_frac, decimals)
+
+    return _add_lead_hours(
+        eval_df[ref_keys].drop_duplicates().merge(keys, on=ref_keys, how="left"),
+        col_keys,
+    )
+
+
+def ProbCircle(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Ensemble probability circles for reliability verification.
+
+    For each case the circle is centred on the ensemble mean position (mean of
+    member unit vectors, so dateline-safe). The radius for nominal probability p
+    is the p-quantile of the member distances to the centre, and a case is a hit
+    if the reference position lies within that radius. Averaging the hit columns
+    over cases gives the observed frequency to plot against p.
+
+    With leave_one_out, each member's distance is measured to the mean of the
+    other members. Members otherwise pull the mean towards themselves and sit
+    closer to it than the truth does, which makes a perfect ensemble look
+    over-confident, increasingly so for small ensembles.
+
+    Additional arguments:
+    levels (sequence): Nominal probabilities. Default 0.1, 0.2, ..., 0.9.
+    leave_one_out (bool): Leave-one-out member distances. Default True.
+    ensemble_fraction (float): Minimum fraction of ensemble members with a valid
+    position required to score a case; cases below it are NaN. The denominator
+    is the number of unique ensemble indices in forecast_df. Default 30%.
+
+    Returns:
+        pd.DataFrame: One row per case with the circle centre (ProbCircle_lat,
+        ProbCircle_lon), the reference distance to the centre (ProbCircle_dist),
+        per level the radius ProbCircle_r<pct> in km and hit flag
+        ProbCircle_hit<pct> (1/0, NaN if not scored), the fraction of member
+        distances below the reference distance (ProbCircle_pit), and member_frac.
+    """
+    radius = kwargs.get("radius", 6371.0)  # km
+    col_keys = kwargs.get(
+        "column_keys",
+        {
+            "storm_id": "sid",
+            "initial_time": "initial_time",
+            "valid_time": "valid_time",
+            "ensemble_idx": "ensemble_idx",
+            "lead_hours": "lead_hours",
+        },
+    )
+    ref_keys = _get_refkeys(col_keys, forecast_df)
+    ens_col = col_keys.get("ensemble_idx", None)
+    if ens_col is None or ens_col not in forecast_df.columns:
+        raise ValueError(
+            "ProbCircle requires an ensemble index column. Please provide it in column_keys."
+        )
+
+    lat_col, lon_col = kwargs.get("position_cols", ("lat", "lon"))
+    decimals = kwargs.get("decimals", 2)
+    levels = np.asarray(kwargs.get("levels", np.round(np.arange(0.1, 1.0, 0.1), 2)))
+    leave_one_out = kwargs.get("leave_one_out", True)
+    min_member_frac = kwargs.get("ensemble_fraction", 0.3)
+    ensemble_size = forecast_df[ens_col].nunique()
+
+    eval_df = forecast_df.merge(
+        reference_df[[*ref_keys, lat_col, lon_col]].drop_duplicates(subset=ref_keys),
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
+    )
+    df = eval_df.dropna(subset=[f"{lat_col}_fcst", f"{lon_col}_fcst"])
+
+    grp = df.groupby(ref_keys, sort=False)
+    case = grp.ngroup().to_numpy()
+    slot = grp.cumcount().to_numpy()
+    n_cases, M = case.max() + 1, slot.max() + 1
+
+    # Padded (case, member) arrays; NaN marks absent/missing members
+    lat = np.full((n_cases, M), np.nan)
+    lon = np.full((n_cases, M), np.nan)
+    lat[case, slot] = df[f"{lat_col}_fcst"].to_numpy()
+    lon[case, slot] = df[f"{lon_col}_fcst"].to_numpy()
+
+    keys = grp.size().reset_index()[ref_keys]
+    y_lat = grp[f"{lat_col}_ref"].first().to_numpy()
+    y_lon = grp[f"{lon_col}_ref"].first().to_numpy()
+
+    m = np.sum(~np.isnan(lat), axis=1)
+    member_frac = m / ensemble_size
+
+    # Ensemble mean position as the normalised mean of member unit vectors
+    xyz = _to_xyz(lat, lon)
+    total = np.nansum(xyz, axis=1)
+    c_lat, c_lon = _to_latlon(total)
+    obs_dist = haversine(c_lat, c_lon, y_lat, y_lon, radius=radius)
+
+    if leave_one_out:
+        l_lat, l_lon = _to_latlon(total[:, None, :] - np.nan_to_num(xyz))
+        mem_dist = haversine(lat, lon, l_lat, l_lon, radius=radius)
     else:
-        pred_cols = pred_col_dict
+        mem_dist = haversine(lat, lon, c_lat[:, None], c_lon[:, None], radius=radius)
 
-    # Check if the reference DataFrame contains the required columns
-    for key in ref_cols.values():
-        if key not in reference.columns:
-            raise ValueError(f"Missing column '{key}' in reference DataFrame.")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN cases
+        radii = np.nanquantile(mem_dist, levels, axis=1)  # (n_levels, n_cases)
+    hits = (obs_dist[None, :] <= radii).astype(float)
+    pit = np.sum(mem_dist < obs_dist[:, None], axis=1) / m
 
-    # Check that the predictions DataFrame contains the required columns
-    for key in pred_cols.values():
-        if key not in predictions.columns:
-            raise ValueError(f"Missing column '{key}' in predictions DataFrame.")
+    invalid = (m < 2) | (member_frac < min_member_frac) | np.isnan(obs_dist)
+    radii[:, invalid] = np.nan
+    hits[:, invalid] = np.nan
+    pit[invalid] = np.nan
 
-    sample_idx = predictions[pred_cols["ensemble_idx"]].unique()[0]
-    CRPS = predictions[predictions[pred_cols["ensemble_idx"]] == sample_idx].copy()
-    # keep only the SID, valid time, and init time columns
-    CRPS = CRPS[[pred_cols["SID"], pred_cols["valid_time"], pred_cols["init_time"]]]
-    # add the target column
-    CRPS["CRPS_haversine"] = np.nan
+    keys["ProbCircle_lat"] = np.round(c_lat, decimals)
+    keys["ProbCircle_lon"] = np.round(c_lon, decimals)
+    keys["ProbCircle_dist"] = np.round(obs_dist, decimals)
+    for p, r, h in zip(levels, radii, hits):
+        pct = int(round(p * 100))
+        keys[f"ProbCircle_r{pct}"] = np.round(r, decimals)
+        keys[f"ProbCircle_hit{pct}"] = h
+    keys["ProbCircle_pit"] = np.round(pit, decimals)
+    keys["member_frac"] = np.round(member_frac, decimals)
 
-    for storm_id in reference.SID.unique():
-        # Get the reference and prediction data for the current storm ID
-        ref_data = reference[reference[ref_cols["SID"]] == storm_id]
-        pred_data = predictions[predictions[pred_cols["SID"]] == storm_id]
-
-        for val_time in pred_data[pred_cols["valid_time"]].unique():
-            # Get the reference and prediction data for the current valid time
-            ref_data_val = ref_data[ref_data[ref_cols["initial_time"]] == val_time]
-            pred_data_val = pred_data[pred_data[pred_cols["valid_time"]] == val_time]
-
-            # if the reference or prediction values are empty strings, set them to NaN
-            ref_data_val.loc[:, ref_cols["lat"]] = ref_data_val[
-                ref_cols["lat"]
-            ].replace(" ", np.nan)
-            ref_data_val.loc[:, ref_cols["lon"]] = ref_data_val[
-                ref_cols["lon"]
-            ].replace(" ", np.nan)
-            pred_data_val.loc[:, pred_cols["lat"]] = pred_data_val[
-                pred_cols["lat"]
-            ].replace(" ", np.nan)
-            pred_data_val.loc[:, pred_cols["lon"]] = pred_data_val[
-                pred_cols["lon"]
-            ].replace(" ", np.nan)
-
-            if len(ref_data_val) == 0 or len(pred_data_val) == 0:
-                continue
-
-            # skip if all values are NaN
-            if (
-                ref_data_val[ref_cols["lat"]].isna().all()
-                or pred_data_val[pred_cols["lat"]].isna().all()
-            ):
-                continue
-
-            for init_time in pred_data_val[pred_cols["init_time"]].unique():
-                ensemble_vals = pred_data_val[
-                    pred_data_val[pred_cols["init_time"]] == init_time
-                ]
-                num_members = len(ensemble_vals)
-                if len(ensemble_vals) == 0:
-                    continue
-
-                ref_lat = ref_data_val[ref_cols["lat"]].to_numpy().astype(np.float32)
-                ref_lon = ref_data_val[ref_cols["lon"]].to_numpy().astype(np.float32)
-
-                diff_track = toolbox.haversine(
-                    ref_lat,
-                    ref_lon,
-                    ensemble_vals[pred_cols["lat"]].to_numpy(),
-                    ensemble_vals[pred_cols["lon"]].to_numpy(),
-                )
-                diff_matrix = toolbox.haversine(
-                    ensemble_vals[pred_cols["lat"]].to_numpy()[:, None],
-                    ensemble_vals[pred_cols["lon"]].to_numpy()[:, None],
-                    ensemble_vals[pred_cols["lat"]].to_numpy()[None, :],
-                    ensemble_vals[pred_cols["lon"]].to_numpy()[None, :],
-                )
-
-                denom = 2 * num_members * (num_members - 1)
-                if denom == 0:
-                    continue
-
-                haver_crps = (
-                    diff_track.mean()
-                    - 1 / (2 * num_members * (num_members - 1)) * diff_matrix.sum()
-                )
-
-                locator = (
-                    (CRPS[pred_cols["SID"]] == storm_id)
-                    & (CRPS[pred_cols["valid_time"]] == val_time)
-                    & (CRPS[pred_cols["init_time"]] == init_time)
-                )
-
-                CRPS.loc[
-                    locator,
-                    "CRPS_haversine",
-                ] = haver_crps
-
-    return CRPS[["CRPS_haversine"]].to_numpy()
+    return _add_lead_hours(
+        eval_df[ref_keys].drop_duplicates().merge(keys, on=ref_keys, how="left"),
+        col_keys,
+    )
 
 
-FCRPS = metric(
-    name="FCRPS",
-    function=_FCRPS,
-    long_name="Fair CRPS",
-    return_labels=["CRPS_vmax", "CRPS_pmin"],
-)
+# %% Binary event (RI) metrics
+def _binary_eval_df(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, kwargs: dict
+) -> tuple[pd.DataFrame, str]:
+    """Merge event probabilities with observed outcomes, keeping only cases where
+    both are defined. Returns the merged DataFrame and the probability column used.
 
-HCRPS = metric(
-    name="HCRPS",
-    function=_HCRPS,
-    long_name="Haversinial CRPS",
-    return_labels=["CRPS_haversine"],
-)
+    Columns: keys, lead hours, _p (probability), _o (outcome), and _m (number of
+    valid members) when the count column is present.
 
-DPE = metric(
-    name="DPE",
-    function=_DPE,
-    long_name="Direct Position Error (Great Circle)",
-    return_labels=["DPE_GCD"],
-)
+    Probabilistic forecasts use 'RI_fraction'; deterministic forecasts fall back
+    to their 0/1 'RI' column. An ensemble summary (count column present) without
+    'RI_fraction' raises, rather than being scored as deterministic.
+    """
+    col_keys = kwargs.get(
+        "column_keys",
+        {
+            "storm_id": "sid",
+            "initial_time": "initial_time",
+            "valid_time": "valid_time",
+        },
+    )
+    ref_keys = _get_refkeys(col_keys, forecast_df)
+    target_col = kwargs.get("target_col", "RI")
+    count_col = kwargs.get("count_col", "n_valid")
 
-CARTE = metric(
-    name="CARTE",
-    function=_CARTE,
-    long_name="Cartesian Cross-Track / Along-Track / Direct Positional Error",
-    return_labels=["Along_TE", "Cross_TE", "DPE_cart"],
-)
+    prob_col = kwargs.get("prob_col", None)
+    if prob_col is None:
+        if "RI_fraction" in forecast_df.columns:
+            prob_col = "RI_fraction"
+        elif count_col in forecast_df.columns:
+            raise ValueError(
+                f"Ensemble forecast ('{count_col}' present) has no 'RI_fraction' "
+                "column; pass prob_col explicitly or keep RI_fraction "
+                "(keep_intensification=True in _compute_RI)."
+            )
+        else:
+            prob_col = "RI"
+    if prob_col not in forecast_df.columns:
+        raise ValueError(f"Missing probability column '{prob_col}' in forecast_df.")
 
-SE = metric(
-    name="SE",
-    function=_SE,
-    unit="kts",
-    long_name="Squared Error",
-    return_labels=["SE_wind", "SE_pressure"],
-)
+    fc_cols = [*ref_keys, prob_col]
+    renames = {prob_col: "_p"}
+    if count_col in forecast_df.columns and count_col != prob_col:
+        fc_cols.append(count_col)
+        renames[count_col] = "_m"
 
-AE = metric(
-    name="AE",
-    function=_AE,
-    long_name="Absolute Error",
-    return_labels=["AE_wind", "AE_pressure"],
-)
+    df = (
+        forecast_df[fc_cols]
+        .rename(columns=renames)
+        .merge(
+            reference_df[[*ref_keys, target_col]]
+            .drop_duplicates(subset=ref_keys)
+            .rename(columns={target_col: "_o"}),
+            on=ref_keys,
+            how="left",
+        )
+    )
+    df = _add_lead_hours(df, col_keys)
+    df = df[df["_p"].notna() & df["_o"].notna()]
+
+    p = df["_p"].to_numpy(dtype=float)
+    if np.any((p < 0) | (p > 1)):
+        raise ValueError(
+            f"Values in '{prob_col}' fall outside [0, 1]; it is not a probability."
+        )
+
+    return df, prob_col
+
+
+def _score_groups(
+    df: pd.DataFrame, group_cols, score_fn, kwargs: dict | None = None
+) -> pd.DataFrame:
+    """Apply score_fn (DataFrame -> dict) per group, or once if group_cols is empty.
+
+    With include_overall (default True), a final row scores all cases pooled,
+    with its group columns set to overall_label (default 'all')."""
+    kwargs = kwargs or {}
+    if not group_cols:
+        return pd.DataFrame([score_fn(df)])
+    rows = []
+    for key, g in df.groupby(group_cols, sort=True):
+        key = key if isinstance(key, tuple) else (key,)
+        rows.append({**dict(zip(group_cols, key)), **score_fn(g)})
+    if kwargs.get("include_overall", True):
+        label = kwargs.get("overall_label", "all")
+        rows.append({**{c: label for c in group_cols}, **score_fn(df)})
+    return pd.DataFrame(rows)
+
+
+def BrierSS(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Brier score and Brier skill score for a binary event (default: RI).
+
+    BS = mean_i (p_i - o_i)^2,  BSS = 1 - BS / BS_ref
+
+    Works for probabilistic (RI_fraction) and deterministic (0/1 RI) forecasts;
+    for the latter BS is the fraction of wrong forecasts. The reference forecast
+    is climatology: by default the sample base rate of each group, for which
+    BS_ref = o_bar (1 - o_bar). Cases where either the probability or the
+    outcome is NaN are excluded.
+
+    Additional arguments:
+    prob_col (str): Forecast probability column. Default 'RI_fraction' if present,
+    else 'RI' (deterministic 0/1).
+    target_col (str): Observed outcome column (1/0/NaN). Default 'RI'.
+    group_cols (list): Columns to score separately. Default ['lead_hours'];
+    an empty list scores all cases together.
+    include_overall (bool): Append a row scoring all cases pooled, with the group
+    columns set to overall_label. Default True.
+    overall_label: Group value of the pooled row. Default 'all'; np.nan keeps
+    the group columns numeric.
+    climatology (float): Fixed reference probability, e.g. a long-term base rate,
+    in lieu of the sample base rate. Default None.
+    reference_forecast (pd.DataFrame): Reference forecast, e.g. a climatology
+    baseline's RI results, in lieu of a constant reference probability. It is
+    scored on the same cases as the forecast; cases it does not cover are
+    excluded. Takes precedence over climatology. Default None.
+    reference_prob_col (str): Probability column of reference_forecast. Default
+    'RI_fraction' if present, else target_col (deterministic 0/1).
+    fair (bool): Use the fair Brier score for finite ensembles (Ferro, 2014),
+    (p - o)^2 - p (1 - p) / (m - 1), with m from count_col (default 'n_valid').
+    Ensembles only; cases with m < 2 are excluded. Default False.
+
+    Returns:
+        pd.DataFrame: One row per group with n, n_events, base_rate, BS, BS_ref,
+        BSS and the probability column scored. BSS is NaN where BS_ref is 0
+        (no events or all events).
+    """
+    group_cols = kwargs.get("group_cols", ["lead_hours"])
+    climatology = kwargs.get("climatology", None)
+    reference_forecast = kwargs.get("reference_forecast", None)
+    fair = kwargs.get("fair", False)
+    decimals = kwargs.get("decimals", 4)
+
+    df, prob_col = _binary_eval_df(reference_df, forecast_df, kwargs)
+    if fair:
+        if "_m" not in df.columns:
+            raise ValueError(
+                "Fair Brier score requires an ensemble member count column (count_col)."
+            )
+        df = df[df["_m"] >= 2]
+
+    if reference_forecast is not None:
+        col_keys = kwargs.get(
+            "column_keys",
+            {
+                "storm_id": "sid",
+                "initial_time": "initial_time",
+                "valid_time": "valid_time",
+            },
+        )
+        ref_keys = _get_refkeys(col_keys, forecast_df)
+        ref_prob_col = kwargs.get("reference_prob_col", None)
+        if ref_prob_col is None:
+            ref_prob_col = (
+                "RI_fraction"
+                if "RI_fraction" in reference_forecast.columns
+                else kwargs.get("target_col", "RI")
+            )
+        if ref_prob_col not in reference_forecast.columns:
+            raise ValueError(
+                f"Missing probability column '{ref_prob_col}' in reference_forecast."
+            )
+        df = df.merge(
+            reference_forecast[[*ref_keys, ref_prob_col]]
+            .drop_duplicates(subset=ref_keys)
+            .rename(columns={ref_prob_col: "_pref"}),
+            on=ref_keys,
+            how="left",
+        )
+        df = df[df["_pref"].notna()]
+
+    def score(g):
+        p = g["_p"].to_numpy(dtype=float)
+        o = g["_o"].to_numpy(dtype=float)
+        n = len(o)
+        bs_i = (p - o) ** 2
+        if fair:
+            bs_i = bs_i - p * (1 - p) / (g["_m"].to_numpy(dtype=float) - 1)
+        base_rate = o.mean() if n else np.nan
+        if reference_forecast is not None:
+            p_ref = g["_pref"].to_numpy(dtype=float)
+            bs_ref = np.mean((p_ref - o) ** 2) if n else np.nan
+        elif climatology is None:
+            bs_ref = base_rate * (1 - base_rate)
+        else:
+            bs_ref = np.mean((climatology - o) ** 2) if n else np.nan
+        bs = bs_i.mean() if n else np.nan
+        bss = 1 - bs / bs_ref if bs_ref > 0 else np.nan
+        return {
+            "n": n,
+            "n_events": int(o.sum()),
+            "base_rate": np.round(base_rate, decimals),
+            "BS": np.round(bs, decimals),
+            "BS_ref": np.round(bs_ref, decimals),
+            "BSS": np.round(bss, decimals),
+        }
+
+    out = _score_groups(df, group_cols, score, kwargs)
+    out["prob_col"] = prob_col
+    return out
+
+
+def RocAUC(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Area under the ROC curve for a binary event (default: RI).
+
+    Computed as the Mann-Whitney statistic: the probability that a randomly
+    chosen event case has a higher forecast probability than a randomly chosen
+    non-event case, with ties counted as 1/2. This equals the trapezoidal area
+    under the ROC curve over all probability thresholds, so it is exact for the
+    discrete probabilities of a finite ensemble. For deterministic 0/1 forecasts
+    it reduces to (POD + 1 - POFD) / 2. 0.5 is no skill, 1 is perfect
+    discrimination. Cases where either the probability or the outcome is NaN
+    are excluded.
+
+    Additional arguments:
+    prob_col (str): Forecast probability column. Default 'RI_fraction' if present,
+    else 'RI' (deterministic 0/1).
+    target_col (str): Observed outcome column (1/0/NaN). Default 'RI'.
+    group_cols (list): Columns to score separately. Default ['lead_hours'];
+    an empty list scores all cases together.
+    include_overall (bool): Append a row scoring all cases pooled, with the group
+    columns set to overall_label. Default True.
+    overall_label: Group value of the pooled row. Default 'all'; np.nan keeps
+    the group columns numeric.
+
+    Returns:
+        pd.DataFrame: One row per group with n, n_events, AUC and the probability
+        column scored. AUC is NaN where a group has no events or no non-events.
+    """
+    group_cols = kwargs.get("group_cols", ["lead_hours"])
+    decimals = kwargs.get("decimals", 4)
+
+    df, prob_col = _binary_eval_df(reference_df, forecast_df, kwargs)
+
+    def score(g):
+        o = g["_o"].to_numpy(dtype=float) == 1
+        n1 = int(o.sum())
+        n0 = len(o) - n1
+        if n1 == 0 or n0 == 0:
+            auc = np.nan
+        else:
+            ranks = g["_p"].rank(method="average").to_numpy()
+            auc = (ranks[o].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)
+        return {"n": len(o), "n_events": n1, "AUC": np.round(auc, decimals)}
+
+    out = _score_groups(df, group_cols, score, kwargs)
+    out["prob_col"] = prob_col
+    return out
+
+
+def CSI(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Critical Success Index (threat score) for a binary event (default: RI).
+
+    CSI = hits / (hits + misses + false alarms)
+
+    A case is forecast as an event when its probability is >= threshold. For
+    deterministic 0/1 forecasts any threshold in (0, 1] gives the same result;
+    for ensembles the default matches the ens_fraction used for the RI flag.
+    Correct negatives do not enter the CSI, so it is not inflated by the many
+    non-RI cases, but it does depend on the base rate. POD, FAR and frequency
+    bias are returned alongside it, e.g. for a performance diagram. Cases where
+    either the probability or the outcome is NaN are excluded.
+
+    Additional arguments:
+    threshold (float or sequence): Probability threshold(s) for a yes forecast.
+    Several thresholds give one row per threshold and group. Default 0.3.
+    prob_col (str): Forecast probability column. Default 'RI_fraction' if present,
+    else 'RI' (deterministic 0/1).
+    target_col (str): Observed outcome column (1/0/NaN). Default 'RI'.
+    group_cols (list): Columns to score separately. Default ['lead_hours'];
+    an empty list scores all cases together.
+    include_overall (bool): Append a row scoring all cases pooled, with the group
+    columns set to overall_label. Default True.
+    overall_label: Group value of the pooled row. Default 'all'; np.nan keeps
+    the group columns numeric.
+
+    Returns:
+        pd.DataFrame: One row per group and threshold with the contingency counts
+        (hits, misses, false_alarms, correct_negatives), POD, FAR, bias, CSI and
+        the probability column scored. Ratios are NaN where their denominator is 0.
+    """
+    group_cols = kwargs.get("group_cols", ["lead_hours"])
+    thresholds = np.atleast_1d(kwargs.get("threshold", 0.3)).astype(float)
+    decimals = kwargs.get("decimals", 4)
+
+    df, prob_col = _binary_eval_df(reference_df, forecast_df, kwargs)
+
+    def ratio(num, den):
+        return np.round(num / den, decimals) if den > 0 else np.nan
+
+    outs = []
+    for thr in thresholds:
+
+        def score(g):
+            yes_f = g["_p"].to_numpy(dtype=float) >= thr
+            yes_o = g["_o"].to_numpy(dtype=float) == 1
+            hits = int(np.sum(yes_f & yes_o))
+            misses = int(np.sum(~yes_f & yes_o))
+            false_alarms = int(np.sum(yes_f & ~yes_o))
+            return {
+                "n": len(yes_o),
+                "hits": hits,
+                "misses": misses,
+                "false_alarms": false_alarms,
+                "correct_negatives": int(np.sum(~yes_f & ~yes_o)),
+                "POD": ratio(hits, hits + misses),
+                "FAR": ratio(false_alarms, hits + false_alarms),
+                "bias": ratio(hits + false_alarms, hits + misses),
+                "CSI": ratio(hits, hits + misses + false_alarms),
+            }
+
+        res = _score_groups(df, group_cols, score, kwargs)
+        res.insert(min(len(group_cols or []), res.shape[1]), "threshold", thr)
+        outs.append(res)
+
+    out = pd.concat(outs, ignore_index=True)
+    out["prob_col"] = prob_col
+    return out
+
+
+def PeirceSS(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Peirce skill score (Hanssen-Kuipers discriminant, true skill statistic)
+    for a binary event (default: RI).
+
+    PSS = POD - POFD = (hits * cn - false_alarms * misses)
+                       / ((hits + misses) * (false_alarms + cn))
+
+    A case is forecast as an event when its probability is >= threshold, as in
+    CSI. PSS ranges from -1 to 1, with 0 for random or constant forecasts and 1
+    for perfect ones. Unlike the CSI it rewards correct negatives and does not
+    depend on the base rate, though for rare events it tends to favour
+    overforecasting, since false alarms are diluted by the many non-events.
+    Cases where either the probability or the outcome is NaN are excluded.
+
+    Additional arguments:
+    threshold (float or sequence): Probability threshold(s) for a yes forecast.
+    Several thresholds give one row per threshold and group. Default 0.3.
+    prob_col (str): Forecast probability column. Default 'RI_fraction' if present,
+    else 'RI' (deterministic 0/1).
+    target_col (str): Observed outcome column (1/0/NaN). Default 'RI'.
+    group_cols (list): Columns to score separately. Default ['lead_hours'];
+    an empty list scores all cases together.
+    include_overall (bool): Append a row scoring all cases pooled, with the group
+    columns set to overall_label. Default True.
+    overall_label: Group value of the pooled row. Default 'all'; np.nan keeps
+    the group columns numeric.
+
+    Returns:
+        pd.DataFrame: One row per group and threshold with the contingency counts
+        (hits, misses, false_alarms, correct_negatives), POD, POFD, PSS and the
+        probability column scored. PSS is NaN where a group has no events or no
+        non-events.
+    """
+    group_cols = kwargs.get("group_cols", ["lead_hours"])
+    thresholds = np.atleast_1d(kwargs.get("threshold", 0.3)).astype(float)
+    decimals = kwargs.get("decimals", 4)
+
+    df, prob_col = _binary_eval_df(reference_df, forecast_df, kwargs)
+
+    def ratio(num, den):
+        return num / den if den > 0 else np.nan
+
+    outs = []
+    for thr in thresholds:
+
+        def score(g):
+            yes_f = g["_p"].to_numpy(dtype=float) >= thr
+            yes_o = g["_o"].to_numpy(dtype=float) == 1
+            hits = int(np.sum(yes_f & yes_o))
+            misses = int(np.sum(~yes_f & yes_o))
+            false_alarms = int(np.sum(yes_f & ~yes_o))
+            correct_negatives = int(np.sum(~yes_f & ~yes_o))
+            pod = ratio(hits, hits + misses)
+            pofd = ratio(false_alarms, false_alarms + correct_negatives)
+            return {
+                "n": len(yes_o),
+                "hits": hits,
+                "misses": misses,
+                "false_alarms": false_alarms,
+                "correct_negatives": correct_negatives,
+                "POD": np.round(pod, decimals),
+                "POFD": np.round(pofd, decimals),
+                "PSS": np.round(pod - pofd, decimals),
+            }
+
+        res = _score_groups(df, group_cols, score, kwargs)
+        res.insert(min(len(group_cols or []), res.shape[1]), "threshold", thr)
+        outs.append(res)
+
+    out = pd.concat(outs, ignore_index=True)
+    out["prob_col"] = prob_col
+    return out
+
+
+# %% Aggregate deterministic metrics
+def RSquared(
+    reference_df: pd.DataFrame, forecast_df: pd.DataFrame, **kwargs
+) -> pd.DataFrame:
+    """Coefficient of determination of the forecasts against the reference.
+
+    R^2 = 1 - SSE / SST,  SSE = sum (f - o)^2,  SST = sum (o - o_bar)^2
+
+    computed over the cases of each group (default: per lead time), with o_bar
+    the reference mean of that group. R^2 is 1 for perfect forecasts, 0 for a
+    forecast no better than the group's reference mean, and negative for worse.
+    Unlike the squared Pearson correlation it penalises bias and amplitude
+    errors. Ensemble members are pooled, each member-case pair counting once.
+    Cases where either the forecast or the reference is NaN are excluded.
+
+    Args:
+        reference_df (pd.DataFrame): DataFrame containing the reference values.
+        forecast_df (pd.DataFrame): DataFrame containing the forecast values.
+        **kwargs: Additional keyword arguments
+
+        Additional arguments:
+        column_keys (dict): Dictionary mapping columns containing the initial time,
+        valid time, and storm ID.
+
+        target_cols (list): Columns to evaluate; those missing from either
+        DataFrame are skipped. Default is ['wind_max', 'pressure_min']
+
+        method (str): 'determination' (default) for 1 - SSE/SST, or 'pearson'
+        for the squared Pearson correlation.
+
+        group_cols (list): Columns to score separately. Default ['lead_hours'];
+        an empty list scores all cases together.
+        include_overall (bool): Append a row scoring all cases pooled, with the group
+        columns set to overall_label. Default True.
+        overall_label: Group value of the pooled row. Default 'all'; np.nan keeps
+        the group columns numeric.
+
+    Returns:
+        pd.DataFrame: One row per group with n_<col> and RSquared_<col> per
+        target. RSquared is NaN where fewer than 2 cases or the reference has no
+        variance.
+    """
+    col_keys = kwargs.get(
+        "column_keys",
+        {
+            "storm_id": "sid",
+            "initial_time": "initial_time",
+            "valid_time": "valid_time",
+            "ensemble_idx": "ensemble_idx",
+            "lead_hours": "lead_hours",
+        },
+    )
+    ref_keys = _get_refkeys(col_keys, forecast_df)
+    target_cols = [
+        c
+        for c in kwargs.get("target_cols", ["wind_max", "pressure_min"])
+        if c in forecast_df.columns and c in reference_df.columns
+    ]
+    method = kwargs.get("method", "determination")
+    if method not in ("determination", "pearson"):
+        raise ValueError("method must be 'determination' or 'pearson'.")
+    group_cols = kwargs.get("group_cols", ["lead_hours"])
+    decimals = kwargs.get("decimals", 4)
+
+    eval_df = forecast_df[[*ref_keys, *target_cols]].merge(
+        reference_df[[*ref_keys, *target_cols]].drop_duplicates(subset=ref_keys),
+        on=ref_keys,
+        how="left",
+        suffixes=("_fcst", "_ref"),
+    )
+    eval_df = _add_lead_hours(eval_df, col_keys)
+
+    def score(g):
+        out = {}
+        for col in target_cols:
+            f = g[f"{col}_fcst"].to_numpy(dtype=float)
+            o = g[f"{col}_ref"].to_numpy(dtype=float)
+            valid = ~np.isnan(f) & ~np.isnan(o)
+            f, o = f[valid], o[valid]
+            n = len(o)
+            r2 = np.nan
+            if n >= 2:
+                sst = np.sum((o - o.mean()) ** 2)
+                if method == "determination" and sst > 0:
+                    r2 = 1 - np.sum((f - o) ** 2) / sst
+                elif method == "pearson" and sst > 0 and np.std(f) > 0:
+                    r2 = np.corrcoef(f, o)[0, 1] ** 2
+            out[f"n_{col}"] = n
+            out[f"RSquared_{col}"] = np.round(r2, decimals)
+        return out
+
+    return _score_groups(eval_df, group_cols, score, kwargs)
+
 
 # %%
