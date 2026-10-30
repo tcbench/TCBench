@@ -70,14 +70,14 @@ ibtracs = ibtracs[ibtracs["ISO_TIME"].dt.year == 2023]
 
 
 # %%
-# Create an empty DataFrame with the desired columns
+# Create an empty DataFrame with the evaluation schema (deterministic, so no
+# ensemble_idx column: evaluate_tracks treats any file that has one as an ensemble)
 columns = [
-    "SID",
-    "Initial Time",
-    "Valid Time",
-    "ensemble_idx",
-    "wind max",
-    "pressure min",
+    "sid",
+    "initial_time",
+    "valid_time",
+    "wind_max",
+    "pressure_min",
     "lat",
     "lon",
 ]
@@ -131,12 +131,11 @@ for file in days:
         # Create a new DataFrame with the current values
         temp_df = pd.DataFrame(
             {
-                "SID": sid,
-                "Initial Time": initial_time,
-                "Valid Time": detected_time,
-                # "ensemble_idx": None because deterministic
-                "wind max": detected_wind,
-                "pressure min": detected_pressure,
+                "sid": sid,
+                "initial_time": initial_time,
+                "valid_time": detected_time,
+                "wind_max": detected_wind,
+                "pressure_min": detected_pressure,
                 "lat": detected_lat,
                 "lon": detected_lon,
             }
@@ -149,10 +148,10 @@ for file in days:
             df = pd.concat([df, temp_df], ignore_index=True)
 
 # %%
-# convert wind to knots
-df["wind max"] = df["wind max"] * 1.94384
+# convert wind to knots, and scale by dividing by 0.88 to convert from 10m wind to 1-min sustained wind
+df["wind_max"] = df["wind_max"] * 1.94384 / 0.88
 # convert pressure to hPa
-df["pressure min"] = df["pressure min"] / 100
+df["pressure_min"] = df["pressure_min"] / 100
 
 # %%
 

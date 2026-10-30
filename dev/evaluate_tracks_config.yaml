@@ -1,0 +1,44 @@
+# Evaluation configuration for evaluate_tracks.py
+# (used when the script is run as __main__)
+
+# --- Paths
+# Relative paths are resolved from the dev folder, where the kernel (or the
+# script) is expected to be launched; absolute paths also work.
+# Folder with the model track files (*.csv, e.g. 2023_AIFS.csv); the IBTrACS
+# ground truth, the baselines (<year>_CLIM-intensity.csv, <year>_PERSISTENCE.csv)
+# and the evaluation results (<model>_det_, _prob_, _ri_<year>[_<basin>].csv)
+# are written here
+eval_directory: "results"
+# IBTrACS file (ibtracs.ALL.list...csv), or a folder holding it as its only file
+ibtracs_tracks_path: "data/ibtracs"
+
+# --- Run settings
+# Evaluation year: forecasts initialized in this year are evaluated
+year: 2023
+# Basin to evaluate (NA, EP, WP, NI, SI, SP or SA), or null for all basins.
+# Output file names are then tagged <year>_<basin>
+basin: null
+# Lead times in hours to evaluate, or null for all lead times in the ground truth.
+# Either a list (e.g. [6, 12, 18, 24, 48, 72, 96, 120]) or a range given as
+# start / stop (both included) / step
+lead_hours: null
+# Track files to evaluate (file names inside eval_directory, e.g.
+# ["2023_AIFS.csv", "2023_GENCAST.csv"]), or null to evaluate every candidate
+# track file found there
+select_files: null
+# Recompute the IBTrACS ground truth even if it already exists in eval_directory
+recompute: true
+verbose: true
+
+# --- Ensembles
+# Minimum fraction of ensemble members with a valid value for a case to be
+# scored; below it, the case's predictions are set to NaN before computing
+# the metrics (wind_max, pressure_min and lat/lon are checked separately)
+ensemble_fraction: 0.3
+
+# --- Rapid intensification (RI)
+# Wind increase (kt) over ri_window hours that counts as RI
+ri_thresh: 30
+ri_window: 24
+# For ensembles, the fraction of members showing RI needed to flag a case as RI
+ri_ens_fraction: 0.3
